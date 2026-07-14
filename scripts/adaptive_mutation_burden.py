@@ -110,7 +110,7 @@ plt.show()
 # %%
 # Extract the pathways that constitute outlier association with the drug response
 out_path = kneed_tbl.query('x <= @kl.knee').Pathway_Name.to_list()
-tmp_gene_set_name = out_path[33]
+tmp_gene_set_name = out_path[0]
 tmp_gene_set = gene_set_to_use_dict[tmp_gene_set_name]
 
 tmp_gene_set_leading_edge_list = tmp_res.query('Pathway_Name == @tmp_gene_set_name').Leading_Edge_Cell_Lines[0]
@@ -142,10 +142,10 @@ def construct_leading_edge_network(
     """
     # 1. Align and slice the matrix to only include our active sub-space
     # Fill NaN with 0.0 to ensure safe math
-    sub_matrix = excess_mutation_df.reindex(
-        index=leading_edge_cells, 
-        columns=pathway_genes
-    ).fillna(0.0).values 
+    sub_matrix = (excess_mutation_df
+                  .query('sanger_model_id in @leading_edge_cells and gene in @pathway_genes')
+                  .pivot_table(index = 'sanger_model_id',columns='gene')
+                  .fillna(0.0).values)
     
     n_cells, n_genes = sub_matrix.shape
     if n_cells == 0 or n_genes == 0:
@@ -206,3 +206,9 @@ def construct_leading_edge_network(
         
     edges_df = pd.DataFrame(edge_accumulator)
     return nodes_df, edges_df
+
+# %%
+
+node_df, edge_df = construct_leading_edge_network(tmp_gene_set,tmp_gene_set_leading_edge_list,tmp_drug_excess_mutation_count_tbl)
+
+
