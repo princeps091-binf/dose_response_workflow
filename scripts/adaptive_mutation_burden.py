@@ -4,9 +4,8 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from importlib import reload
 from scipy.stats import beta
-from scipy.stats import binom
-import xlmhglite
 import networkx as nx
+import itertools
 import src.utils.io 
 import src.mutation.gene_set_analysis
 import src.dose_response.detect_response
@@ -110,24 +109,8 @@ plt.show()
 # %%
 # Extract the pathways that constitute outlier association with the drug response
 out_path = kneed_tbl.query('x <= @kl.knee').Pathway_Name.to_list()
-tmp_gene_set_name = out_path[0]
-tmp_gene_set = gene_set_to_use_dict[tmp_gene_set_name]
-
-tmp_gene_set_leading_edge_list = tmp_res.query('Pathway_Name == @tmp_gene_set_name').Leading_Edge_Cell_Lines[0]
-
-dose_data_tbl.query('DRUG_ID == @drug_id and SANGER_MODEL_ID in @tmp_gene_set_leading_edge_list').AUC
-
-gene_set_collection_excess_count_df.loc[tmp_gene_set_leading_edge_list,tmp_gene_set_name]
-
-tmp_drug_excess_mutation_count_tbl.query('sanger_model_id in @tmp_gene_set_leading_edge_list').assign(in_tmp_set = lambda df: df.gene.isin(tmp_gene_set)).query('in_tmp_set')
-
-tmp_drug_excess_mutation_count_tbl.query('sanger_model_id in @tmp_gene_set_leading_edge_list').assign(in_tmp_set = lambda df: df.gene.isin(tmp_gene_set)).query('in_tmp_set').groupby('gene').agg(ncell = ('sanger_model_id','nunique'),s_em = ('excess_mutation_count','sum')).reset_index().assign(lead_prop = lambda df: df.ncell.div(float(len(tmp_gene_set_leading_edge_list))),avg_m = lambda df: df.s_em.div(float(len(tmp_gene_set_leading_edge_list))),Pathwat_Name = tmp_gene_set_name).sort_values('avg_m')
-
 # %%
 
-import numpy as np
-import pandas as pd
-import itertools
 
 def construct_leading_edge_network(
     pathway_genes: list,
@@ -209,6 +192,13 @@ def construct_leading_edge_network(
 
 # %%
 
+tmp_gene_set_name = out_path[70]
+tmp_gene_set = gene_set_to_use_dict[tmp_gene_set_name]
+
+tmp_gene_set_leading_edge_list = tmp_res.query('Pathway_Name == @tmp_gene_set_name').Leading_Edge_Cell_Lines[0]
+
+dose_data_tbl.query('DRUG_ID == @drug_id and SANGER_MODEL_ID in @tmp_gene_set_leading_edge_list').AUC
+
 node_df, edge_df = construct_leading_edge_network(tmp_gene_set,tmp_gene_set_leading_edge_list,tmp_drug_excess_mutation_count_tbl)
 
-
+edge_df.sort_values('Co_Occurrence_Prevalence')
