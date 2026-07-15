@@ -5,6 +5,7 @@ from pathlib import Path
 from importlib import reload
 from scipy.stats import beta
 from scipy.spatial.distance import cdist
+from scipy.spatial import cKDTree
 from scipy.interpolate import griddata
 import xlmhglite
 import networkx as nx
@@ -84,7 +85,7 @@ def spectral_hilbert_layout(G, gap_size=4):
             # algebraic_connectivity returns the eigenvalue, 
             # fiedler_vector returns the actual 1D layout vector
             try:
-                fiedler = nx.fiedler_vector(subgraph, weight='w', method='tracemin')
+                fiedler = nx.fiedler_vector(subgraph, weight='w', method='scipy')
                 
                 # Pair nodes with their spectral coordinate and sort them
                 node_fiedler_pairs = list(zip(subgraph.nodes(), fiedler))
@@ -166,30 +167,39 @@ def compute_distance_aware_edge_samples(pos, G_network, density_factor=3.0):
             
     return sample_x, sample_y, sample_z
 
-def apply_topological_edge_mask(xi, yi, zi, sample_x, sample_y, threshold=0.6):
+
+def apply_topological_edge_mask(xi, yi, zi, sample_x, sample_y, threshold=0.6, actual_k =5):
     """
     Masks out meshgrid pixels that are too far from actual sampled edge traces.
     Prevents spatial bleedthrough across un-connected network territory.
+    Memory-safe version using a k-d tree.
     """
-    # 1. Flatten the dense meshgrid coordinates into a single N x 2 matrix
-    grid_points = np.vstack([xi.flatten(), yi.flatten()]).T
-    
-    # 2. Bundle the scattered edge samples into an M x 2 matrix
-    edge_points = np.vstack([sample_x, sample_y]).T
+    # 1. Bundle the scattered edge samples into an M x 2 matrix
+    edge_points = np.column_stack([sample_x, sample_y])
     
     if len(edge_points) == 0:
         return zi
         
-    # 3. Compute the pairwise distance matrix optimized in C
-    # cdist(N x 2, M x 2) yields an N x M distance matrix
-    # .min(axis=1) extracts the distance to the absolute nearest active edge trace
-    min_distances = cdist(grid_points, edge_points).min(axis=1)
+    # 2. Build a fast spatial lookup tree from the edge points
+    # This takes virtually zero memory and builds in milliseconds
+    tree = cKDTree(edge_points)
     
+    # 3. Flatten the dense meshgrid coordinates
+    grid_points = np.column_stack([xi.ravel(), yi.ravel()])
+    
+    # 4. Query the tree: Find the distance to the single NEAREST edge point
+    # k=1 tells the tree to only look for the 1 nearest neighbor (no dense matrix allocated!)
+    min_distances, _ = tree.query(grid_points, k=actual_k, workers=5) # workers=-1 uses all CPU cores
+    # 5. Take the average distance of those k neighbors for each grid point
+    # If k_neighbors was 1, we don't need to average (axis 1 won't exist)
+    if actual_k > 1:
+        avg_distances = np.mean(min_distances, axis=1)
+    else:
+        avg_distances = min_distances   
     # Reshape the 1D distance array back into the 2D matrix shape of our grid
-    min_distances_grid = min_distances.reshape(xi.shape)
+    min_distances_grid = avg_distances.reshape(xi.shape)
     
-    # 4. Apply the topological mask
-    # We make a hard copy to prevent modifying the array in place, avoiding side effects
+    # 5. Apply the topological mask
     masked_zi = np.copy(zi)
     masked_zi[min_distances_grid > threshold] = np.nan
     
@@ -202,7 +212,7 @@ def generate_edge_contour_matrices(pos, G_network, grid_side, resolution=250):
     """
     # 1. Extract the distance-aware scattered points
     sample_x, sample_y, sample_z = compute_distance_aware_edge_samples(
-        pos, G_network, density_factor=100.0
+        pos, G_network, density_factor=5.0
     )
     
     # Guard against empty networks
@@ -222,7 +232,7 @@ def generate_edge_contour_matrices(pos, G_network, grid_side, resolution=250):
     
     # 4. Optional: Apply an Alpha Mask (Fix from earlier)
     # This prevents the edges from bleeding into un-connected background territory
-    zi = apply_topological_edge_mask(xi, yi, zi, sample_x, sample_y, threshold=0.7)
+    zi = apply_topological_edge_mask(xi, yi, zi, sample_x, sample_y, threshold=0.7, actual_k = 5)
     
     return xi, yi, zi
 

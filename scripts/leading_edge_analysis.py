@@ -267,7 +267,7 @@ agg_G_node_attr_tbl = pd.DataFrame.from_dict(pos,orient='index',columns=['x','y'
 node_sizes = [tmp_cell_gene_burden_tbl.query('gene == @node').qscore.iloc[0] * 1e3 if tmp_cell_gene_burden_tbl.query('gene == @node').shape[0] > 0 else 10 for node in agg_G.nodes() ]
 
 
-exi,eyi,ezi = src.integration.leading_edge.generate_edge_contour_matrices(pos,agg_G,pd.DataFrame(pos).iloc[0,:].max())
+exi,eyi,ezi = src.integration.leading_edge.generate_edge_contour_matrices(pos,agg_G,pd.DataFrame(pos).iloc[0,:].max(),resolution=50)
 
 fig, ax = plt.subplots(figsize=(13, 12))  # Dark tech background
 ax.set_facecolor('#090d16')

@@ -16,7 +16,7 @@ reload(src.integration.gene_burden)
 reload(src.mutation.gene_set_analysis)
 reload(src.dose_response.detect_response)
 reload(src.utils.io)
-
+reload(src.integration.leading_edge)
 # %%
 vcf_folder = Path("/home/vipink/Documents/dose_response_workflow/data/omics/mutations_wes_vcf_20250226/")
 vcf_file_list = list(vcf_folder.glob("*.gz"))
@@ -77,7 +77,7 @@ N_vector = total_exome_loads.reindex(all_cells).fillna(0).values.reshape(-1, 1) 
 #3 Vorinostat = 1012
 # Gefitinib = 1010
 #1 Trametinib = 1372 
-drug_id = 1012
+drug_id = 1372
 
 tmp_drug_excess_mutation_count_tbl = src.mutation.gene_set_analysis.get_excess_mutation_count_matrix(drug_id,K_matrix,N_vector,dose_data_tbl,all_cells,all_genes)
 
@@ -125,15 +125,17 @@ def construct_leading_edge_network(
     """
     # 1. Align and slice the matrix to only include our active sub-space
     # Fill NaN with 0.0 to ensure safe math
-    sub_matrix = (excess_mutation_df
+    sub_matrix_df = (excess_mutation_df
                   .query('sanger_model_id in @leading_edge_cells and gene in @pathway_genes')
                   .pivot_table(index = 'sanger_model_id',columns='gene')
-                  .fillna(0.0).values)
-    
+                  .fillna(0.0)
+                  )
+    obs_genes = [t[1] for t in sub_matrix_df.columns]
+    sub_matrix = sub_matrix_df.values
+    print(obs_genes)
     n_cells, n_genes = sub_matrix.shape
     if n_cells == 0 or n_genes == 0:
         return pd.DataFrame(), pd.DataFrame()
-    
     # Total pathway burden per cell line (Sum across columns)
     # Shape: (n_cells, 1) to allow broadcasting
     cell_pathway_totals = np.sum(sub_matrix, axis=1, keepdims=True)
@@ -145,9 +147,8 @@ def construct_leading_edge_network(
     node_prevalence = np.mean(sub_matrix > 0.0, axis=0)
     # Intensity: Average excess score over the leading edge
     node_intensity = np.mean(sub_matrix, axis=0)
-    
     node_records = []
-    for g_idx, gene in enumerate(pathway_genes):
+    for g_idx, gene in enumerate(obs_genes):
         node_records.append({
             'Gene': gene,
             'Weight_Prevalence': node_prevalence[g_idx],
@@ -160,15 +161,15 @@ def construct_leading_edge_network(
     
     # Generate all unique gene pairs within the pathway
     for i, j in itertools.combinations(range(n_genes), 2):
-        gene_i = pathway_genes[i]
-        gene_j = pathway_genes[j]
+        gene_i = obs_genes[i]
+        gene_j = obs_genes[j]
         
         # Identify cell lines where BOTH genes have non-zero excess mutations
         co_occurrence_mask = (sub_matrix[:, i] > 0.0) & (sub_matrix[:, j] > 0.0)
         co_occurring_cells_count = np.sum(co_occurrence_mask)
         
-        if co_occurring_cells_count == 0:
-            continue # No edge if they never mutate together in the leading edge
+        if co_occurring_cells_count < 2:
+            continue # No edge if they never mutate together less than 2 leading edge cell lines
             
         # Extract the sum of the pair's scores for co-occurring cells
         pair_sum = sub_matrix[co_occurrence_mask, i] + sub_matrix[co_occurrence_mask, j]
@@ -191,14 +192,134 @@ def construct_leading_edge_network(
     return nodes_df, edges_df
 
 # %%
+agg_edge_df_list = []
+agg_node_df_list = []
 
-tmp_gene_set_name = out_path[70]
-tmp_gene_set = gene_set_to_use_dict[tmp_gene_set_name]
+for tmp_gene_set_name in out_path:
+    print(tmp_gene_set_name)
+    tmp_gene_set = gene_set_to_use_dict[tmp_gene_set_name]
+    tmp_gene_set_leading_edge_list = tmp_res.query('Pathway_Name == @tmp_gene_set_name').Leading_Edge_Cell_Lines.iloc[0]
+    node_df, edge_df = construct_leading_edge_network(tmp_gene_set,tmp_gene_set_leading_edge_list,tmp_drug_excess_mutation_count_tbl)
+    agg_edge_df_list.append(edge_df.assign(Pathway_Name = tmp_gene_set_name))
+    agg_node_df_list.append(node_df.assign(Pathway_Name = tmp_gene_set_name))
 
-tmp_gene_set_leading_edge_list = tmp_res.query('Pathway_Name == @tmp_gene_set_name').Leading_Edge_Cell_Lines[0]
+# %%
+def noisy_or_merge(series: pd.Series) -> float:
+    """
+    Computes the Noisy-OR probability: 1 - Prod(1 - w_i)
+    Assumes weights are bounded between 0 and 1.
+    """
+    # Clip to safety bounds [0, 1] to prevent floating-point anomalies
+    weights = np.clip(series.values, 0.0, 1.0)
+    return 1.0 - np.prod(1.0 - weights)
 
-dose_data_tbl.query('DRUG_ID == @drug_id and SANGER_MODEL_ID in @tmp_gene_set_leading_edge_list').AUC
+def aggregate_pathway_networks_probabilistic_product(
+    pathway_nodes_list: list[pd.DataFrame], 
+    pathway_edges_list: list[pd.DataFrame], 
+    pathway_names: list[str]                
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Consolidates multiple pathway networks using a dual Noisy-OR product 
+    formulation for edge weights to balance prevalence and intensity.
+    """
+    # --- 1. Consolidate Nodes (Noisy-OR) ---
+    all_nodes = []
+    for df, path_name in zip(pathway_nodes_list, pathway_names):
+        if df.empty:
+            continue
+        temp = df.copy()
+        temp['Pathway_Name'] = path_name
+        all_nodes.append(temp)
+        
+    global_nodes_raw = pd.concat(all_nodes, ignore_index=True)
+    
+    global_nodes = global_nodes_raw.groupby('Gene').agg(
+        Consolidated_Intensity=('Weight_Intensity', noisy_or_merge),
+        Consolidated_Prevalence=('Weight_Prevalence', noisy_or_merge),
+        Pathway_Count=('Pathway_Name', 'nunique'),
+        Pathways=('Pathway_Name', lambda x: list(x.unique()))
+    ).reset_index()
+    
+    # --- 2. Consolidate Edges using Dual Noisy-OR Product ---
+    all_edges = []
+    for df, path_name in zip(pathway_edges_list, pathway_names):
+        if df.empty:
+            continue
+        temp = df.copy()
+        sorted_pairs = np.sort(temp[['Source', 'Target']].values, axis=1)
+        temp['Source'] = sorted_pairs[:, 0]
+        temp['Target'] = sorted_pairs[:, 1]
+        temp['Pathway_Name'] = path_name
+        all_edges.append(temp)
+        
+    global_edges_raw = pd.concat(all_edges, ignore_index=True)
+    
+    # Run independent Noisy-OR merges on raw Edge Weight and Co-Occurrence Prevalence
+    global_edges = global_edges_raw.groupby(['Source', 'Target']).agg(
+        Noisy_OR_Intensity=('Edge_Weight', noisy_or_merge),
+        Noisy_OR_Prevalence=('Co_Occurrence_Prevalence', noisy_or_merge),
+        Total_Co_Occurrence=('Co_Occurrence_Count', 'sum'),
+        Crosstalk_Index=('Pathway_Name', 'nunique'),
+        Pathways=('Pathway_Name', lambda x: list(x.unique()))
+    ).reset_index()
+    
+    # Calculate the final probabilistic product weight
+    global_edges['Consolidated_Edge_Weight'] = (
+        global_edges['Noisy_OR_Intensity'] * global_edges['Noisy_OR_Prevalence']
+    )
+    
+    # Sort network by this consolidated metric
+    global_edges = global_edges.sort_values(by='Consolidated_Edge_Weight', ascending=False).reset_index(drop=True)
+    
+    return global_nodes, global_edges
 
-node_df, edge_df = construct_leading_edge_network(tmp_gene_set,tmp_gene_set_leading_edge_list,tmp_drug_excess_mutation_count_tbl)
+# %%
 
-edge_df.sort_values('Co_Occurrence_Prevalence')
+obs_paths_list = pd.concat(agg_node_df_list).Pathway_Name.unique()
+agg_node_df, agg_edge_df = aggregate_pathway_networks_probabilistic_product(agg_node_df_list,agg_edge_df_list,obs_paths_list)
+
+tmp_ax = agg_edge_df.assign(pr = lambda df: df.Consolidated_Edge_Weight.rank(pct=True)).plot(x='pr',y='Consolidated_Edge_Weight')
+plt.show()
+
+
+# %%
+agg_G =  nx.from_pandas_edgelist(
+        agg_edge_df.loc[:,['Source','Target','Consolidated_Edge_Weight']].rename(columns={'Consolidated_Edge_Weight':'weight'}), 
+    source='Source', 
+    target='Target', 
+    edge_attr='weight' 
+)
+pos = src.integration.leading_edge.spectral_hilbert_layout(agg_G, gap_size=4)
+centrality = nx.degree_centrality(agg_G)
+node_sizes = [1 + (centrality[node] * 10000) for node in agg_G.nodes()]
+
+# %%
+# Plotting the result
+plt.figure(figsize=(8, 8))
+nx.draw_networkx_nodes(agg_G, pos, node_size=node_sizes, node_color='#4D96FF')
+nx.draw_networkx_edges(agg_G, pos, alpha=0.2, edge_color='black')
+nx.draw_networkx_labels(agg_G, pos, font_size=10, font_color='grey')
+
+plt.title("Spectral (Fiedler Vector) Hilbert Layout")
+plt.axis('off')
+plt.show()
+# %%
+
+exi,eyi,ezi = src.integration.leading_edge.generate_edge_contour_matrices(pos,agg_G,pd.DataFrame(pos).iloc[0,:].max(),resolution=500)
+
+# %%
+node_size_dict = (agg_node_df.loc[:,['Gene','Consolidated_Intensity']].set_index('Gene').to_dict())['Consolidated_Intensity']
+fig, ax = plt.subplots(figsize=(13, 12))  # Dark tech background
+ax.set_facecolor('#090d16')
+nx.draw_networkx_nodes(agg_G, pos, node_size=[10 ** (2 * node_size_dict[node]) for node in agg_G.nodes()], node_color='#4D96FF')
+nx.draw_networkx_edges(agg_G, pos, alpha=0.5, edge_color='grey')
+nx.draw_networkx_labels(agg_G, pos, font_size=10, font_color='black')
+contour_filled = ax.contourf(exi, eyi, ezi, levels=20, cmap='plasma', alpha=0.8, zorder=1)
+ax.set_xlim(-1, pd.DataFrame.from_dict(pos,orient='index',columns=['x','y']).x.max() + 1)
+ax.set_ylim(-1, pd.DataFrame.from_dict(pos,orient='index',columns=['x','y']).y.max() + 1)
+plt.title("Spectral (Fiedler Vector) Hilbert Layout")
+plt.axis('off')
+plt.show()
+# %%
+[node_size_dict[node] for node in agg_G.nodes()]
+
