@@ -75,17 +75,18 @@ N_vector = total_exome_loads.reindex(all_cells).fillna(0).values.reshape(-1, 1) 
 # %%
 #2 Lapatinib = 1558
 #3 Vorinostat = 1012
+# Paclitaxel = 1080
+# Vemurafenib = 
 # Gefitinib = 1010
 #1 Trametinib = 1372 
-drug_id = 1372
+# Osimertinib = 1919 ->
+drug_id = 1919
 
 tmp_drug_excess_mutation_count_tbl = src.mutation.gene_set_analysis.get_excess_mutation_count_matrix(drug_id,K_matrix,N_vector,dose_data_tbl,all_cells,all_genes)
 
-# %%
 
 gene_set_collection_excess_count_df = src.mutation.gene_set_analysis.compute_all_pathway_burdens_vectorized(tmp_drug_excess_mutation_count_tbl,all_cells,all_genes,gene_set_to_use_dict)
 
-# %%
 
 tmp_res = src.mutation.gene_set_analysis.run_high_throughput_parallel_xlmhg(
     pathway_burden_df = gene_set_collection_excess_count_df,   
@@ -132,7 +133,7 @@ def construct_leading_edge_network(
                   )
     obs_genes = [t[1] for t in sub_matrix_df.columns]
     sub_matrix = sub_matrix_df.values
-    print(obs_genes)
+    #print(obs_genes)
     n_cells, n_genes = sub_matrix.shape
     if n_cells == 0 or n_genes == 0:
         return pd.DataFrame(), pd.DataFrame()
@@ -311,7 +312,7 @@ exi,eyi,ezi = src.integration.leading_edge.generate_edge_contour_matrices(pos,ag
 node_size_dict = (agg_node_df.loc[:,['Gene','Consolidated_Intensity']].set_index('Gene').to_dict())['Consolidated_Intensity']
 fig, ax = plt.subplots(figsize=(13, 12))  # Dark tech background
 ax.set_facecolor('#090d16')
-nx.draw_networkx_nodes(agg_G, pos, node_size=[10 ** (2 * node_size_dict[node]) for node in agg_G.nodes()], node_color='#4D96FF')
+nx.draw_networkx_nodes(agg_G, pos, node_size=[10 ** ( node_size_dict[node]) for node in agg_G.nodes()], node_color='#4D96FF')
 nx.draw_networkx_edges(agg_G, pos, alpha=0.5, edge_color='grey')
 nx.draw_networkx_labels(agg_G, pos, font_size=10, font_color='black')
 contour_filled = ax.contourf(exi, eyi, ezi, levels=20, cmap='plasma', alpha=0.8, zorder=1)
@@ -321,5 +322,116 @@ plt.title("Spectral (Fiedler Vector) Hilbert Layout")
 plt.axis('off')
 plt.show()
 # %%
-[node_size_dict[node] for node in agg_G.nodes()]
+# interactive form for this visualisation using plotly
+import plotly.graph_objects as go
 
+def create_interactive_network_explorer(
+    pos: dict,                  # dict of {gene: (x, y)} from your Hilbert layout
+    global_nodes: pd.DataFrame, # Columns: ['Gene', 'Consolidated_Intensity', 'Consolidated_Prevalence', ...]
+    xi: np.ndarray,             # 2D grid X coordinates from your contour step
+    yi: np.ndarray,             # 2D grid Y coordinates
+    zi: np.ndarray,             # 2D grid Z (density) coordinates (with NaNs for masked areas)
+    output_html_path: str = "network_explorer.html"
+):
+    """
+    Generates a high-performance, zoomable, interactive HTML visualizer
+    combining contour edge densities with dynamic gene labels.
+    """
+    # 1. Map node positions to our DataFrame for vectorized Plotly rendering
+    nodes_df = global_nodes.copy()
+    nodes_df['X'] = nodes_df['Gene'].map(lambda g: pos[g][0] if g in pos else np.nan)
+    nodes_df['Y'] = nodes_df['Gene'].map(lambda g: pos[g][1] if g in pos else np.nan)
+    nodes_df = nodes_df.dropna(subset=['X', 'Y'])
+    
+    # Create descriptive hover text for each gene node
+    nodes_df['Hover_Text'] = nodes_df.apply(
+        lambda row: (
+            f"<b>Gene:</b> {row['Gene']}<br>"
+            f"<b>Consolidated Intensity:</b> {row['Consolidated_Intensity']:.3f}<br>"
+            f"<b>Consolidated Prevalence:</b> {row['Consolidated_Prevalence']:.3f}<br>"
+            f"<b>Pathways Involved:</b> {len(row['Pathways'])}<br>"
+#            f"<b>Primary Pathways:</b> {', '.join(row['Pathways'][:3])}"
+        ), axis=1
+    )
+    
+    # 2. Build the Plotly Figure
+    fig = go.Figure()
+    
+    # --- Layer 1: Background Edge Contours ---
+    # We use a custom colorscale (e.g., Viridis or Blues) with transparency (opacity)
+    if xi is not None and yi is not None and zi is not None:
+        fig.add_trace(
+            go.Contour(
+                x=xi[:, 0], # 1D array of X coordinates
+                y=yi[0, :], # 1D array of Y coordinates
+                z=zi.T,
+                colorscale='Plasma',
+                showscale=True,
+                colorbar=dict(title="Edge Density / Functional Cohort Weight", len=0.4, y=0.3),
+                contours=dict(coloring='heatmap', showlabels=False),
+                line=dict(width=0), # Hides harsh contour line boundaries
+                opacity=0.9,
+                hoverinfo='skip' # Do not intercept hover signals intended for nodes
+            )
+        )
+        
+    # --- Layer 2: Foreground Interactive Gene Nodes ---
+    # Size nodes by prevalence, color them by overall mutational intensity
+    marker_sizes = 1 + (nodes_df['Consolidated_Prevalence'] * 25) # Map prevalence to [8, 33]px
+    
+    fig.add_trace(
+        go.Scatter(
+            x=nodes_df['X'],
+            y=nodes_df['Y'],
+            mode='markers+text', # 'text' enables on-plot labels
+            text=nodes_df['Gene'], # The actual gene names
+            textposition="top center",
+            hovertext=nodes_df['Hover_Text'],
+            hoverinfo='text',
+            marker=dict(
+                size=marker_sizes,
+                color=nodes_df['Consolidated_Intensity'],
+                colorscale='Hot',
+                showscale=True,
+                colorbar=dict(title="Mutational Intensity (Noisy-OR)", len=0.4, y=0.8),
+                line=dict(width=1.5, color='white'), # Clean white border around nodes
+            ),
+            # This is the secret to dynamic labels:
+            # We hide the labels until the user zooms in close, preventing a giant text block
+            textfont=dict(
+                size=10,
+                color="black"
+            )
+        )
+    )
+    
+    # 3. Apply Polished Layout settings
+    fig.update_layout(
+        title="Consolidated Genomic Vulnerability Landscape",
+        title_font=dict(size=18),
+        xaxis=dict(
+            showgrid=False, zeroline=False, showticklabels=False, 
+            range=[0, xi.max() if xi is not None else 60]
+        ),
+        yaxis=dict(
+            showgrid=False, zeroline=False, showticklabels=False,
+            range=[0, yi.max() if yi is not None else 60]
+        ),
+        plot_bgcolor='rgb(245, 245, 245)', # Soft off-white background
+        width=1100,
+        height=900,
+        hoverlabel=dict(
+            bgcolor="white",
+            font_size=12,
+            font_family="monospace"
+        ),
+        dragmode='pan' # Sets pan as default drag behavior for easy canvas exploration
+    )
+    
+    # Save to a standalone HTML file containing all necessary JS/CSS
+    fig.write_html(output_html_path, auto_open=True)
+    print(f"Interactive dashboard successfully generated: {output_html_path}")
+
+# %%
+
+create_interactive_network_explorer(pos,agg_node_df,exi,eyi,ezi)
