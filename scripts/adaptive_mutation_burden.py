@@ -80,7 +80,7 @@ N_vector = total_exome_loads.reindex(all_cells).fillna(0).values.reshape(-1, 1) 
 # Gefitinib = 1010
 #1 Trametinib = 1372 
 # Osimertinib = 1919 ->
-drug_id = 1919
+drug_id = 1558
 
 tmp_drug_excess_mutation_count_tbl = src.mutation.gene_set_analysis.get_excess_mutation_count_matrix(drug_id,K_matrix,N_vector,dose_data_tbl,all_cells,all_genes)
 
@@ -377,13 +377,14 @@ def create_interactive_network_explorer(
         
     # --- Layer 2: Foreground Interactive Gene Nodes ---
     # Size nodes by prevalence, color them by overall mutational intensity
-    marker_sizes = 1 + (nodes_df['Consolidated_Prevalence'] * 25) # Map prevalence to [8, 33]px
-    
+    node_weights =  nodes_df['Consolidated_Prevalence'].to_numpy()
+    marker_sizes = 1 + (node_weights * 25)
+    node_names = nodes_df['Gene'].to_list()
     fig.add_trace(
         go.Scatter(
             x=nodes_df['X'],
             y=nodes_df['Y'],
-            mode='markers+text', # 'text' enables on-plot labels
+            mode='markers', # 'text' enables on-plot labels
             text=nodes_df['Gene'], # The actual gene names
             textposition="top center",
             hovertext=nodes_df['Hover_Text'],
@@ -403,6 +404,39 @@ def create_interactive_network_explorer(
                 color="black"
             )
         )
+    )
+    threshold_steps = np.linspace(0.0, float(np.max(node_weights)), 21)
+    slider_steps = []
+    for val in threshold_steps:
+        # Mask out nodes below the threshold (set marker size to 0)
+        # Nodes above threshold retain their calculated size
+        filtered_sizes = np.where(node_weights >= val, marker_sizes, 0)
+        # Also hide text labels for masked nodes
+        filtered_text = np.where(node_weights >= val, node_names, "")
+        print(len(node_weights) == len(marker_sizes))
+        step = dict(
+            method="restyle",
+            label=f"{val:.2f}",
+            args=[
+                {
+                    "marker.size": [filtered_sizes],
+                    "text": [filtered_text]
+                },
+                [1]  # Target TRACE INDEX 1 (The Gene Nodes trace)
+            ]
+        )
+        slider_steps.append(step)
+    # --- Attach Slider Layout to Plotly ---
+    fig.update_layout(
+        sliders=[dict(
+            active=0,
+            currentvalue={"prefix": "Min Node Weight Threshold: "},
+            pad={"t": 50},
+            steps=slider_steps
+        )],
+        title="Interactive Gene Network Overlaid on Mutational Landscape",
+        xaxis=dict(showgrid=False, zeroline=False),
+        yaxis=dict(showgrid=False, zeroline=False)
     )
     
     # 3. Apply Polished Layout settings
@@ -425,6 +459,7 @@ def create_interactive_network_explorer(
             font_size=12,
             font_family="monospace"
         ),
+        hovermode='closest',
         dragmode='pan' # Sets pan as default drag behavior for easy canvas exploration
     )
     
@@ -434,4 +469,8 @@ def create_interactive_network_explorer(
 
 # %%
 
-create_interactive_network_explorer(pos,agg_node_df,exi,eyi,ezi)
+create_interactive_network_explorer(pos,agg_node_df,exi,eyi,ezi,output_html_path='./img/lapatinib_c2_network.html')
+
+# %%
+
+
