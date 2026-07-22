@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 from importlib import reload
-from scipy.stats import beta
+from scipy.stats import beta, hypergeom
 import networkx as nx
 import itertools
 import src.utils.io 
@@ -112,7 +112,61 @@ plt.show()
 out_path = kneed_tbl.query('x <= @kl.knee').Pathway_Name.to_list()
 # %%
 
+leading_count_tbl = tmp_res.query("Pathway_Name in @out_path").loc[:,['Leading_Edge_Cell_Lines']].explode('Leading_Edge_Cell_Lines').drop_duplicates().merge(dose_data_tbl.query('DRUG_ID == @drug_id').loc[:,['SANGER_MODEL_ID','CANCER_TYPE']],left_on='Leading_Edge_Cell_Lines',right_on='SANGER_MODEL_ID').groupby('CANCER_TYPE').agg(ncl = ('SANGER_MODEL_ID','nunique')).reset_index()
 
+null_tbl = dose_data_tbl.query('DRUG_ID == @drug_id').loc[:,['SANGER_MODEL_ID','CANCER_TYPE']].groupby('CANCER_TYPE').agg(bg_n = ('SANGER_MODEL_ID','nunique')).reset_index()
+
+N_total = dose_data_tbl.query('DRUG_ID == @drug_id').loc[:,['SANGER_MODEL_ID']].drop_duplicates().shape[0]
+N_le = tmp_res.query("Pathway_Name in @out_path").loc[:,['Leading_Edge_Cell_Lines']].explode('Leading_Edge_Cell_Lines').drop_duplicates().shape[0]
+# %%
+leading_enrich_stat_tbl = (
+leading_count_tbl.merge(null_tbl)
+.assign(
+        pval = lambda df: hypergeom.sf(df.ncl -1,M=N_total,n=df.bg_n,N=N_le),
+        expected_k = lambda df: hypergeom.stats(M=N_total,n=df.bg_n,N=N_le,moments='m'),
+        variance_k = lambda df: hypergeom.stats(M=N_total,n=df.bg_n,N=N_le,moments='v'))
+.assign(z_score =lambda df: (df.ncl - df.expected_k) / np.sqrt(df.variance_k))
+)
+
+# %%
+import plotly.express as px
+fig = px.treemap(
+        leading_enrich_stat_tbl,
+        path=[px.Constant("All Leading Edge Cells"), 'CANCER_TYPE'],
+        values='ncl',
+        color='z_score',
+        color_continuous_scale='RdBu_r', # Red = Enriched, Blue = Depleted
+        color_continuous_midpoint=0.0,
+        hover_data={
+            'ncl': True,
+            'bg_n': True,
+            'expected_k': ':.2f',
+            'z_score': ':.2f',
+            'pval': ':.2e'
+        },
+        labels={
+            'ncl': 'Leading Edge Count',
+            'bg_n': 'Total Library Count',
+            'z_score': 'Enrichment Z-Score',
+            'pval': 'p-value'
+        },
+        title=f"Cell-Type Composition & Enrichment for {drug_id} Leading Edge (n={N_le})"
+    )
+
+fig.update_traces(
+    hovertemplate="<b>%{label}</b><br>" +
+                  "Observed Count: %{value}<br>" +
+                  "Enrichment Z-score: %{color:.2f}<br>" +
+                  "<extra></extra>"
+)
+fig.update_layout(
+    margin=dict(t=50, l=10, r=10, b=10),
+    coloraxis_colorbar=dict(title="Enrichment<br>Z-Score")
+)
+
+fig.write_html(f'treemap_{drug_id}.html')
+
+# %%
 def construct_leading_edge_network(
     pathway_genes: list,
     leading_edge_cells: list,
@@ -203,6 +257,8 @@ for tmp_gene_set_name in out_path:
     node_df, edge_df = construct_leading_edge_network(tmp_gene_set,tmp_gene_set_leading_edge_list,tmp_drug_excess_mutation_count_tbl)
     agg_edge_df_list.append(edge_df.assign(Pathway_Name = tmp_gene_set_name))
     agg_node_df_list.append(node_df.assign(Pathway_Name = tmp_gene_set_name))
+
+
 
 # %%
 def noisy_or_merge(series: pd.Series) -> float:
@@ -405,7 +461,7 @@ def create_interactive_network_explorer(
             )
         )
     )
-    threshold_steps = np.linspace(0.0, float(np.max(node_weights)), 21)
+    threshold_steps = np.linspace(0.0, float(np.max(node_weights)), 11)
     slider_steps = []
     for val in threshold_steps:
         # Mask out nodes below the threshold (set marker size to 0)
@@ -413,7 +469,6 @@ def create_interactive_network_explorer(
         filtered_sizes = np.where(node_weights >= val, marker_sizes, 0)
         # Also hide text labels for masked nodes
         filtered_text = np.where(node_weights >= val, node_names, "")
-        print(len(node_weights) == len(marker_sizes))
         step = dict(
             method="restyle",
             label=f"{val:.2f}",
