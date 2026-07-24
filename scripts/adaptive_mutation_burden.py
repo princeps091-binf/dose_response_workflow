@@ -205,3 +205,19 @@ plt.show()
 
 src.integration.leading_edge.create_interactive_network_explorer(pos,agg_node_df,exi,eyi,ezi,output_html_path=f'./img/{drug_name}_c2_network.html')
 
+# %%
+# Examine whether individual cell lines display excess mutation at gene set level
+
+
+gene_set_collection_excess_count_df.loc[:,[out_path[0]]]
+
+leading_edge_cell_lines_tbl = tmp_res.loc[:,['Pathway_Name','Min_mHG_P_Value','Optimal_Burden_Threshold_Tau','Leading_Edge_Cell_Lines']].query('Pathway_Name in @out_path').Leading_Edge_Cell_Lines.explode().value_counts().sort_values().reset_index().rename(columns={'Leading_Edge_Cell_Lines':'SANGER_MODEL_ID','count':'leading_count'})
+
+dose_data_tbl.query('DRUG_ID == @drug_id').loc[:,['SANGER_MODEL_ID','sensitivity_p','AUC']].merge(leading_edge_cell_lines_tbl,how='left').fillna(0).assign(in_lead = lambda df: df.leading_count.gt(61)).groupby('in_lead').agg(mp = ('AUC','mean'))
+# %%
+tmp_cell_line = leading_edge_cell_lines_tbl.iloc[90,0]
+
+agg_node_df.loc[:,['Gene','Consolidated_Intensity']].merge(
+        tmp_drug_excess_mutation_count_tbl.query('sanger_model_id == @tmp_cell_line').loc[:,['gene','excess_mutation_count']],left_on='Gene',right_on='gene',how='left'
+        ).drop('gene',axis=1).fillna(0).excess_mutation_count.sum()
+
