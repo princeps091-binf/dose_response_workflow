@@ -80,7 +80,7 @@ N_vector = total_exome_loads.reindex(all_cells).fillna(0).values.reshape(-1, 1) 
 # Gefitinib = 1010
 #1 Trametinib = 1372 
 # Osimertinib = 1919 ->
-drug_id = 1010
+drug_id = 1012
 drug_name = dose_data_tbl.query('DRUG_ID == @drug_id').DRUG_NAME.iloc[0]
 tmp_drug_excess_mutation_count_tbl = src.mutation.gene_set_analysis.get_excess_mutation_count_matrix(drug_id,K_matrix,N_vector,dose_data_tbl,all_cells,all_genes)
 
@@ -152,6 +152,15 @@ fig.update_layout(
 )
 
 fig.write_html(f'img/treemap_{drug_name}.html')
+
+# %%
+
+tmp_drug_all_leading_edge_cell_lines_list = tmp_res.query('Pathway_Name in @out_path').Leading_Edge_Cell_Lines.explode().unique()
+
+tmp_ax = dose_data_tbl.query('DRUG_ID == @drug_id').assign(leading_edge = lambda df: df.SANGER_MODEL_ID.isin(tmp_drug_all_leading_edge_cell_lines_list)).groupby('leading_edge').AUC.plot.kde(legend=True)
+
+plt.show()
+
 # %%
 agg_edge_df_list = []
 agg_node_df_list = []
@@ -174,13 +183,14 @@ tmp_ax = agg_edge_df.assign(pr = lambda df: df.Consolidated_Edge_Weight.rank(pct
 plt.show()
 
 
-# %%
 agg_G =  nx.from_pandas_edgelist(
         agg_edge_df.loc[:,['Source','Target','Consolidated_Edge_Weight']].rename(columns={'Consolidated_Edge_Weight':'weight'}), 
     source='Source', 
     target='Target', 
     edge_attr='weight' 
 )
+
+# %%
 pos = src.integration.leading_edge.spectral_hilbert_layout(agg_G, gap_size=4)
 
 # Plotting the result
@@ -208,16 +218,43 @@ src.integration.leading_edge.create_interactive_network_explorer(pos,agg_node_df
 # %%
 # Examine whether individual cell lines display excess mutation at gene set level
 
+tmp_drug_out_path_thresh = tmp_res.query('Pathway_Name in @out_path').loc[:,['Pathway_Name','Optimal_Burden_Threshold_Tau']]
+tmp_drug_out_path_excess_count_df = gene_set_collection_excess_count_df.loc[:,out_path]
 
-gene_set_collection_excess_count_df.loc[:,[out_path[0]]]
+tmp_drug_out_path_excess_count_df.gt(tmp_drug_out_path_thresh.set_index('Pathway_Name').loc[tmp_drug_out_path_excess_count_df.columns.to_list(),'Optimal_Burden_Threshold_Tau'].to_numpy(),axis=1).any(axis=1).sum()
 
+
+tmp_drug_out_path_excess_count_df.lt(tmp_drug_out_path_thresh.set_index('Pathway_Name').loc[tmp_drug_out_path_excess_count_df.columns.to_list(),'Optimal_Burden_Threshold_Tau'].to_numpy(),axis=1).all(axis=1)
+# %%
 leading_edge_cell_lines_tbl = tmp_res.loc[:,['Pathway_Name','Min_mHG_P_Value','Optimal_Burden_Threshold_Tau','Leading_Edge_Cell_Lines']].query('Pathway_Name in @out_path').Leading_Edge_Cell_Lines.explode().value_counts().sort_values().reset_index().rename(columns={'Leading_Edge_Cell_Lines':'SANGER_MODEL_ID','count':'leading_count'})
 
 dose_data_tbl.query('DRUG_ID == @drug_id').loc[:,['SANGER_MODEL_ID','sensitivity_p','AUC']].merge(leading_edge_cell_lines_tbl,how='left').fillna(0).assign(in_lead = lambda df: df.leading_count.gt(61)).groupby('in_lead').agg(mp = ('AUC','mean'))
 # %%
-tmp_cell_line = leading_edge_cell_lines_tbl.iloc[90,0]
 
-agg_node_df.loc[:,['Gene','Consolidated_Intensity']].merge(
-        tmp_drug_excess_mutation_count_tbl.query('sanger_model_id == @tmp_cell_line').loc[:,['gene','excess_mutation_count']],left_on='Gene',right_on='gene',how='left'
-        ).drop('gene',axis=1).fillna(0).excess_mutation_count.sum()
+def compute_graph_recovery_score(tmp_cell_line,node_df,edge_df,excess_mutation_df):
+    tmp_cell_line_excess_mutation_tbl = (
+        node_df.loc[:,['Gene','Consolidated_Intensity']]
+         .merge(
+        excess_mutation_df.query('sanger_model_id == @tmp_cell_line').loc[:,['gene','excess_mutation_count']],left_on='Gene',right_on='gene',how='left'
+        ).drop('gene',axis=1)
+    .fillna(0)
+    .query('excess_mutation_count > 0')
+    .assign(gscore = lambda df: df.excess_mutation_count * df.Consolidated_Intensity)
+    )
+    tmp_cell_line_edge_df = (
+    agg_edge_df
+    .query('Source in @tmp_cell_line_excess_mutation_tbl.Gene and Target in @tmp_cell_line_excess_mutation_tbl.Gene')
+        )
+    return (tmp_cell_line_excess_mutation_tbl.Consolidated_Intensity.sum() + tmp_cell_line_edge_df.Consolidated_Edge_Weight.sum())/(node_df.Consolidated_Intensity.sum() + edge_df.Consolidated_Edge_Weight.sum())
 
+# %%
+cell_line_list = tmp_drug_excess_mutation_count_tbl.sanger_model_id.unique().tolist()
+graph_score = [compute_graph_recovery_score(tmp_cell,agg_node_df,agg_edge_df,tmp_drug_excess_mutation_count_tbl) for tmp_cell in cell_line_list]
+
+# %%
+g_to_auc_tbl = pd.DataFrame({'SANGER_MODEL_ID':cell_line_list,'gscore':graph_score}).merge(dose_data_tbl.query('DRUG_ID == @drug_id').loc[:,['SANGER_MODEL_ID','AUC','sensitivity_p']],how='left').dropna()
+
+# %%
+
+tmp_ax = g_to_auc_tbl.plot.scatter(x='gscore',y='sensitivity_p',logy=True)
+plt.show()
