@@ -80,7 +80,7 @@ N_vector = total_exome_loads.reindex(all_cells).fillna(0).values.reshape(-1, 1) 
 # Gefitinib = 1010
 #1 Trametinib = 1372 
 # Osimertinib = 1919 ->
-drug_id = 1919
+drug_id = 1010
 drug_name = dose_data_tbl.query('DRUG_ID == @drug_id').DRUG_NAME.iloc[0]
 tmp_drug_excess_mutation_count_tbl = src.mutation.gene_set_analysis.get_excess_mutation_count_matrix(drug_id,K_matrix,N_vector,dose_data_tbl,all_cells,all_genes)
 
@@ -142,9 +142,176 @@ gene_set_collection_excess_count_df.loc[tmp_LE_list,out_path[0]]
 
 gene_set_collection_excess_count_df.loc['SIDM00210',out_path[0]]
 
-tmp_drug_out_path_thresh = tmp_res.query('Pathway_Name in @out_path').loc[:,['Pathway_Name','Optimal_Burden_Threshold_Tau']]
+# %%
+
 tmp_drug_out_path_excess_count_df = gene_set_collection_excess_count_df.loc[:,out_path]
 
-tmp_drug_out_path_excess_count_df.gt(tmp_drug_out_path_thresh.set_index('Pathway_Name').loc[tmp_drug_out_path_excess_count_df.columns.to_list(),'Optimal_Burden_Threshold_Tau'].to_numpy(),axis=1).sum(axis=1).sort_values()
+out_path_leading_edge_member_list = tmp_res.query('Pathway_Name in @out_path').loc[:,['Pathway_Name','Leading_Edge_Cell_Lines']].set_index('Pathway_Name').loc[tmp_drug_out_path_excess_count_df.columns,'Leading_Edge_Cell_Lines'].to_list()
+
+def compute_leading_edge_quantiles_vectorized(
+    burdens_df: pd.DataFrame, 
+    le_cell_lists: list[list[str]]
+) -> pd.DataFrame:
+    """
+    Computes F_{c,p} (the LE quantile score) for all cell lines across all pathways.
+    
+    Parameters:
+    -----------
+    burdens_df : pd.DataFrame (N cell lines x K pathways)
+        Matrix of continuous pathway mutation burdens.
+    le_cell_lists : list of list of str (length K)
+        List containing the list of LE cell line identifiers for each pathway.
+        Order must match burdens_df.columns.
+    Returns:
+    --------
+    F_df : pd.DataFrame (N cell lines x K pathways)
+        Matrix of continuous LE depth scores bounded in [0, 1].
+    """
+    cell_ids = burdens_df.index
+    pathway_names = burdens_df.columns
+    N, K = burdens_df.shape
+    
+    # 1. Convert burdens to 2D NumPy array (N x K)
+    B = burdens_df.values
+    
+    # 2. Build Binary LE Indicator Matrix M (N x K)
+    # M[i, j] = 1 if cell line i is in LE_j, else 0
+    cell_to_idx = {cell: i for i, cell in enumerate(cell_ids)}
+    M = np.zeros((N, K), dtype=bool)
+    
+    for p_idx, le_cells in enumerate(le_cell_lists):
+        valid_indices = [cell_to_idx[c] for c in le_cells if c in cell_to_idx]
+        M[valid_indices, p_idx] = True
+    # 3. Compute Size of LE per pathway (1 x K)
+    le_counts = M.sum(axis=0, keepdims=True) # shape: (1, K)
+    # Avoid division by zero if a pathway has 0 LE cells
+    le_counts_safe = np.where(le_counts == 0, 1, le_counts)
+    # 4. FULLY VECTORIZED ECDF COMPUTATION
+    # --------------------------------------------------------------------------
+    # For memory efficiency on large matrices, we operate column-by-column across 
+    # pathways (K iterations), broadcasting N x N comparisons in vectorized C memory.
+    F = np.zeros((N, K), dtype=float)
+    
+    for p in range(K):
+        if le_counts[0, p] == 0:
+            continue
+            
+        # Extract all cell line burdens for pathway p: shape (N, 1)
+        b_all = B[:, p:p+1]
+        
+        # Extract ONLY leading-edge burdens for pathway p: shape (1, n_p)
+        b_le = B[M[:, p], p:p+1].T
+        
+        # Outer comparison matrix via broadcasting: shape (N, n_p)
+        # Compares every cell line burden against all LE burdens for this pathway
+        comparison_matrix = (b_le <= b_all)
+        
+        # Sum across LE cells and divide by total LE size: shape (N,)
+        F[:, p] = comparison_matrix.mean(axis=1)
+    # 5. Zero out cell lines that do not meet the minimum LE threshold cutoff T_p*
+    # Optional guard: if a cell's burden is lower than min(LE_p), ensure score is 0.0
+    # min_le_burden = np.where(M, B, np.inf).min(axis=0, keepdims=True)
+    # F = np.where(B >= min_le_burden, F, 0.0)
+    return pd.DataFrame(F, index=cell_ids, columns=pathway_names)
+
+# %%
+
+out_path_leading_edge_score_tbl = compute_leading_edge_quantiles_vectorized(tmp_drug_out_path_excess_count_df,out_path_leading_edge_member_list)
+# %%
+tmp_ax = (
+        out_path_leading_edge_score_tbl.sum(axis=1).sort_values().reset_index().rename(columns= {0:'score'}).merge(
+dose_data_tbl.query('DRUG_ID == @drug_id').loc[:,['SANGER_MODEL_ID','AUC','sensitivity_p']],
+left_on='sanger_model_id',
+right_on='SANGER_MODEL_ID',
+how='left'
+        )
+.dropna()
+.plot
+.scatter(x='score',y='AUC')
+)
+plt.show()
+
+# %%
+
+def augment_features_for_or_logic(F_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Augments the leading-edge feature matrix F with max-pooling 
+    and hit-count features to help linear models capture OR-gate logic.
+    """
+    F_augmented = F_df.copy()
+    
+    # 1. Max-Pooling Feature: Captures the single strongest pathway hit (OR-gate helper)
+    F_augmented['F_max'] = F_df.max(axis=1)
+    
+    # 2. Hit Count / MPV-Score: Captures cumulative pathway exceedances (> 0 threshold)
+    F_augmented['F_count'] = (F_df > 0).sum(axis=1)
+    
+    return F_augmented
+
+# %%
+cell_ids = tmp_drug_out_path_excess_count_df.index
+pathway_names = tmp_drug_out_path_excess_count_df.columns
+all_le_cells_set = set(c for sublist in out_path_leading_edge_member_list for c in sublist)
+y_union = pd.Series(cell_ids.isin(all_le_cells_set).astype(int), index=cell_ids)
+
+F_augmented_df = augment_features_for_or_logic(out_path_leading_edge_score_tbl)
+# -------------------------------------------------------------------------
+# 3. FIT LOGISTIC REGRESSION ON FULL COHORT
+# -------------------------------------------------------------------------
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report, roc_auc_score, precision_recall_curve, auc
+clf = LogisticRegression(
+    l1_ratio=0,
+    solver='liblinear',
+    random_state=42
+)
+
+clf.fit(out_path_leading_edge_score_tbl, y_union)
+y_probs = clf.predict_proba(out_path_leading_edge_score_tbl)[:, 1]
 
 
+clf.fit(F_augmented_df, y_union)
+y_probs = clf.predict_proba(F_augmented_df)[:, 1]
+# %%
+# -------------------------------------------------------------------------
+# 4. EVALUATE PROOF-OF-CONCEPT METRICS
+# -------------------------------------------------------------------------
+precision, recall, _ = precision_recall_curve(y_union, y_probs)
+pr_auc = auc(recall, precision)
+roc_auc = roc_auc_score(y_union, y_probs)
+
+
+print("\n--- PoC Model Performance ---")
+print(f"ROC-AUC: {roc_auc:.4f}")
+print(f"PR-AUC:  {pr_auc:.4f}")
+
+# %%
+# Extract non-zero learned coefficients (Selected Pathways)
+coef_df = pd.DataFrame({
+    'Pathway': F_augmented_df.columns,
+    'Coefficient (Beta)': clf.coef_[0],
+    'Odds_Ratio': np.exp(clf.coef_[0])
+}).sort_values(by='Coefficient (Beta)', ascending=False)
+
+selected_coefs = coef_df[coef_df['Coefficient (Beta)'] > 0]
+
+# %%
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Compare F_count vs F_max colored by LE_union target
+plt.figure(figsize=(8, 5))
+sns.scatterplot(
+    data=F_augmented_df, 
+    x='F_count', 
+    y='F_max', 
+    hue=y_union, 
+    alpha=0.7,
+    palette={0: 'gray', 1: 'red'}
+)
+plt.title("Distribution of LE_union Responders across F_count and F_max")
+plt.xlabel("Pathway Hit Count (F_count)")
+plt.ylabel("Max Pathway Depth (F_max)")
+plt.grid(True, linestyle='--', alpha=0.5)
+plt.show()
