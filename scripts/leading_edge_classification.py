@@ -94,7 +94,7 @@ tmp_res = src.mutation.gene_set_analysis.run_high_throughput_parallel_xlmhg(
     n_burden_steps = 20,
     auc_col = 'sensitivity_p',
     sanger_id_col = 'SANGER_MODEL_ID',
-    n_jobs = 8  # Use all available CPU cores
+    n_jobs = 8  
 )
 
 # %%
@@ -102,46 +102,15 @@ tmp_res = src.mutation.gene_set_analysis.run_high_throughput_parallel_xlmhg(
 from kneed import KneeLocator, find_shape
 kneed_tbl = tmp_res.assign(x = lambda df: df.Min_mHG_P_Value.rank(pct=True),y=lambda df:-np.log10(df.Min_mHG_P_Value)).sort_values('x').loc[:,['Pathway_Name','x','y']]
 
-tmp_ax = kneed_tbl.plot(x='x',y='y')
-plt.show()
 
 direction, curve = find_shape(kneed_tbl.x.to_numpy(), kneed_tbl.y.to_numpy())
 kl = KneeLocator(kneed_tbl.x.to_numpy(), kneed_tbl.y.to_numpy(), curve=curve, direction=direction)
 
-# %%
-tot_cell_lines = np.zeros(kneed_tbl.x.nunique())
-for tmp_idx, tmp_x in enumerate(kneed_tbl.x.unique()):
-    out_path = kneed_tbl.query('x <= @tmp_x').Pathway_Name.to_list()
-    tmp_drug_all_leading_edge_cell_lines_list = tmp_res.query('Pathway_Name in @out_path').Leading_Edge_Cell_Lines.explode().unique()
-    tot_cell_lines[tmp_idx] = len(tmp_drug_all_leading_edge_cell_lines_list)
-
-# %%
-
-tmp_ax = pd.DataFrame({'x':kneed_tbl.x.unique(),'ncell':tot_cell_lines}).plot(x='x',y='ncell',logx=True)
-
-tmp_ax.axvline(x=kl.knee, color='red', linestyle='--', linewidth=2, label='Threshold')
-plt.show()
-
-# %%
-tmp_ax = dose_data_tbl.query('DRUG_ID == @drug_id').assign(leading_edge = lambda df: df.SANGER_MODEL_ID.isin(tmp_drug_all_leading_edge_cell_lines_list)).groupby('leading_edge').AUC.plot.kde(legend=True)
-
-plt.show()
-
-# %%
-
 out_path = kneed_tbl.query('x <= @kl.knee').Pathway_Name.to_list()
-# %%
 
-
-drug_to_cell_assoc_tbl = tmp_res.loc[:,['Pathway_Name','Leading_Edge_Cell_Lines','Min_mHG_P_Value']].assign(mHG_q = lambda df: pd.qcut(df.Min_mHG_P_Value,q=50)).explode('Leading_Edge_Cell_Lines').merge(dose_data_tbl.query('DRUG_ID == @drug_id').loc[:,['SANGER_MODEL_ID','sensitivity_p','AUC']],left_on='Leading_Edge_Cell_Lines',right_on='SANGER_MODEL_ID',how='left')
-
-drug_to_cell_assoc_tbl.groupby(['SANGER_MODEL_ID','AUC','sensitivity_p']).agg(min_mHG =('Min_mHG_P_Value','min'),max_mHG = ('Min_mHG_P_Value','max') ).sort_values('sensitivity_p').reset_index()
-
-tmp_LE_list = tmp_res.query('Pathway_Name == @out_path[0]').Leading_Edge_Cell_Lines.to_list()[0]
-gene_set_collection_excess_count_df.loc[tmp_LE_list,out_path[0]]
-
-gene_set_collection_excess_count_df.loc['SIDM00210',out_path[0]]
-
+tmp_ax = kneed_tbl.plot(x='x',y='y')
+tmp_ax.axvline(x=kl.knee, color="red", linestyle="--", linewidth=1.5, label="Knee Point")
+plt.show()
 # %%
 
 tmp_drug_out_path_excess_count_df = gene_set_collection_excess_count_df.loc[:,out_path]
@@ -217,6 +186,7 @@ def compute_leading_edge_quantiles_vectorized(
 # %%
 
 out_path_leading_edge_score_tbl = compute_leading_edge_quantiles_vectorized(tmp_drug_out_path_excess_count_df,out_path_leading_edge_member_list)
+
 # %%
 tmp_ax = (
         out_path_leading_edge_score_tbl.sum(axis=1).sort_values().reset_index().rename(columns= {0:'score'}).merge(
@@ -233,41 +203,56 @@ plt.show()
 
 # %%
 
-def augment_features_for_or_logic(F_df: pd.DataFrame) -> pd.DataFrame:
+def augment_features_for_or_logic(F_df: pd.DataFrame, pathway_rank_df: pd.DataFrame) -> pd.DataFrame:
     """
     Augments the leading-edge feature matrix F with max-pooling 
     and hit-count features to help linear models capture OR-gate logic.
     """
-    F_augmented = F_df.copy()
+    common_pathways = F_df.columns.intersection(pathway_rank_df.Pathway_Name)
     
+    if len(common_pathways) == 0:
+        raise ValueError("No matching pathways found between F_matrix columns and pathway_mhg_pvalues index.")
+    F_augmented = F_df.copy().loc[:,common_pathways]
+    pathway_ranking = 1 - pathway_rank_df.loc[:,['Pathway_Name','x']].set_index('Pathway_Name').loc[common_pathways].assign(tmp_rank = lambda df: df.x.rank(pct=True,ascending=True))
     # 1. Max-Pooling Feature: Captures the single strongest pathway hit (OR-gate helper)
-    F_augmented['F_max'] = F_df.max(axis=1)
-    
+    lead_max = F_df.max(axis=1)
+    top_pathway_per_cell = F_df.idxmax(axis=1)
+    cell_top_ranks = pathway_ranking.loc[top_pathway_per_cell]
+    F_augmented['F_max_rank'] = cell_top_ranks.tmp_rank.to_numpy()
+    F_augmented['F_max'] = lead_max
+    F_augmented['F_max_weight'] = F_augmented['F_max'] * F_augmented['F_max_rank']
     # 2. Hit Count / MPV-Score: Captures cumulative pathway exceedances (> 0 threshold)
     F_augmented['F_count'] = (F_df > 0).sum(axis=1)
-    
     return F_augmented
 
 # %%
 cell_ids = tmp_drug_out_path_excess_count_df.index
 pathway_names = tmp_drug_out_path_excess_count_df.columns
 all_le_cells_set = set(c for sublist in out_path_leading_edge_member_list for c in sublist)
-y_union = pd.Series(cell_ids.isin(all_le_cells_set).astype(int), index=cell_ids)
+LE_count_tbl = pd.DataFrame({'SANGER_MODEL_ID':out_path_leading_edge_member_list}).explode('SANGER_MODEL_ID').value_counts().reset_index().rename(columns={'count':'path_count'})
+LE_cells = LE_count_tbl.query('path_count > 20').SANGER_MODEL_ID.to_list()
+y_union = pd.Series(cell_ids.isin(LE_cells).astype(int), index=cell_ids)
 
-F_augmented_df = augment_features_for_or_logic(out_path_leading_edge_score_tbl)
+F_augmented_df = augment_features_for_or_logic(out_path_leading_edge_score_tbl,kneed_tbl)
 # -------------------------------------------------------------------------
 # 3. FIT LOGISTIC REGRESSION ON FULL COHORT
 # -------------------------------------------------------------------------
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report, roc_auc_score, precision_recall_curve, auc
+# clf = LogisticRegression(
+#     l1_ratio=1,
+#     solver='liblinear',
+#     random_state=42
+# )
 clf = LogisticRegression(
-    l1_ratio=0,
-    solver='liblinear',
-    random_state=42
+    l1_ratio=0.5,  # 0.5 = equal mix of L1 (Lasso) and L2 (Ridge)
+    C=1,  # Inverse of regularization strength (smaller C = stronger penalty)
+    solver="saga",
+    max_iter=10000,  # SAGA requires higher max_iter to converge
+    random_state=42,
 )
-
-clf.fit(out_path_leading_edge_score_tbl, y_union)
-y_probs = clf.predict_proba(out_path_leading_edge_score_tbl)[:, 1]
+# clf.fit(out_path_leading_edge_score_tbl, y_union)
+# y_probs = clf.predict_proba(out_path_leading_edge_score_tbl)[:, 1]
 
 
 clf.fit(F_augmented_df, y_union)
@@ -279,7 +264,7 @@ y_probs = clf.predict_proba(F_augmented_df)[:, 1]
 precision, recall, _ = precision_recall_curve(y_union, y_probs)
 pr_auc = auc(recall, precision)
 roc_auc = roc_auc_score(y_union, y_probs)
-
+print(y_union.mean())
 
 print("\n--- PoC Model Performance ---")
 print(f"ROC-AUC: {roc_auc:.4f}")
@@ -289,29 +274,25 @@ print(f"PR-AUC:  {pr_auc:.4f}")
 # Extract non-zero learned coefficients (Selected Pathways)
 coef_df = pd.DataFrame({
     'Pathway': F_augmented_df.columns,
-    'Coefficient (Beta)': clf.coef_[0],
+    'Beta': clf.coef_[0],
     'Odds_Ratio': np.exp(clf.coef_[0])
-}).sort_values(by='Coefficient (Beta)', ascending=False)
+}).sort_values(by='Beta', ascending=False)
 
-selected_coefs = coef_df[coef_df['Coefficient (Beta)'] > 0]
+LE_count_tbl = pd.DataFrame({'SANGER_MODEL_ID':out_path_leading_edge_member_list}).explode('SANGER_MODEL_ID').value_counts().reset_index().rename(columns={'count':'path_count'})
+tmp_le = y_union[y_union.gt(0)].index.tolist()
+tmp_ax = dose_data_tbl.query('DRUG_ID == @drug_id').assign(LE = lambda df: np.where(df.SANGER_MODEL_ID.isin(tmp_le),'Leading_Edge','Rest')).groupby('LE').AUC.plot.kde(legend=True,title='AUC')
+plt.show()
 
 # %%
 
-import matplotlib.pyplot as plt
-import seaborn as sns
 
-# Compare F_count vs F_max colored by LE_union target
-plt.figure(figsize=(8, 5))
-sns.scatterplot(
-    data=F_augmented_df, 
-    x='F_count', 
-    y='F_max', 
-    hue=y_union, 
-    alpha=0.7,
-    palette={0: 'gray', 1: 'red'}
-)
-plt.title("Distribution of LE_union Responders across F_count and F_max")
-plt.xlabel("Pathway Hit Count (F_count)")
-plt.ylabel("Max Pathway Depth (F_max)")
-plt.grid(True, linestyle='--', alpha=0.5)
+tmp_ax =( dose_data_tbl
+         .query('DRUG_ID == @drug_id')
+         .merge(LE_count_tbl)
+         .assign(LE = lambda df: pd.qcut(df.path_count,[0.01,0.1,0.25,0.5,0.75,0.95,1]))
+         .groupby('LE').AUC.plot.kde(legend=True)
+         )
+plt.show()
+# %%
+tmp_ax= dose_data_tbl.query('DRUG_ID == @drug_id').merge(LE_count_tbl,how='left').fillna(0).assign(AUC_rank = lambda df: df.AUC.rank(pct=True,ascending=True)).plot.scatter(x='AUC_rank',y='path_count')
 plt.show()

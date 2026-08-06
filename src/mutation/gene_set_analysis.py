@@ -336,7 +336,7 @@ def _process_single_pathway_worker(path_name, scores, sorted_cells, X_param, L_p
     Worker function executing the 2D sweep for a single pathway.
     Operates on a read-only slice of memory. Allocates its own local DP table.
     """
-    positive_scores = scores[scores > 0.0]
+    positive_scores = scores[scores >= 0.0]
     if len(positive_scores) < X_param:
         return None
         
