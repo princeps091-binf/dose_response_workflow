@@ -230,7 +230,7 @@ cell_ids = tmp_drug_out_path_excess_count_df.index
 pathway_names = tmp_drug_out_path_excess_count_df.columns
 all_le_cells_set = set(c for sublist in out_path_leading_edge_member_list for c in sublist)
 LE_count_tbl = pd.DataFrame({'SANGER_MODEL_ID':out_path_leading_edge_member_list}).explode('SANGER_MODEL_ID').value_counts().reset_index().rename(columns={'count':'path_count'})
-LE_cells = LE_count_tbl.query('path_count > 20').SANGER_MODEL_ID.to_list()
+LE_cells = LE_count_tbl.query('path_count > 0').SANGER_MODEL_ID.to_list()
 y_union = pd.Series(cell_ids.isin(LE_cells).astype(int), index=cell_ids)
 
 F_augmented_df = augment_features_for_or_logic(out_path_leading_edge_score_tbl,kneed_tbl)
@@ -239,11 +239,55 @@ F_augmented_df = augment_features_for_or_logic(out_path_leading_edge_score_tbl,k
 # -------------------------------------------------------------------------
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report, roc_auc_score, precision_recall_curve, auc
+from sklearn.model_selection import StratifiedKFold
 # clf = LogisticRegression(
 #     l1_ratio=1,
 #     solver='liblinear',
 #     random_state=42
 # )
+# %%
+# 1. Initialize Stratified K-Fold Cross-Validation
+
+n_splits = 10
+skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+# Array to store Out-of-Fold (OOF) predicted probabilities
+oof_probs = np.zeros(len(y_union))
+for fold, (train_idx, val_idx) in enumerate(skf.split(F_augmented_df, y_union)):
+    # Split data
+    X_train, X_val = F_augmented_df.iloc[train_idx], F_augmented_df.iloc[val_idx]
+    y_train, y_val = y_union.iloc[train_idx], y_union.iloc[val_idx]
+    # Initialize ElasticNet Logistic Regression
+    clf = LogisticRegression(
+        l1_ratio=0.5,  # Equal mix of L1 (Lasso) and L2 (Ridge)
+        C=1.0,         # Inverse regularization strength
+        solver="saga",
+        max_iter=10000,
+        random_state=42 + fold  # Vary random state per fold
+    )
+    # Fit model on training fold
+    clf.fit(X_train, y_train)
+    # Predict probabilities on validation fold
+    oof_probs[val_idx] = clf.predict_proba(X_val)[:, 1]
+
+# 3. Compute Out-of-Fold (OOF) Evaluation Metrics
+oof_preds = (oof_probs >= 0.5).astype(int)
+
+# %%
+# Precision-Recall AUC (PR-AUC)
+precision, recall, _ = precision_recall_curve(y_union, oof_probs)
+oof_pr_auc = auc(recall, precision)
+
+# ROC-AUC
+oof_roc_auc = roc_auc_score(y_union, oof_probs)
+
+print(f"--- Out-of-Fold (OOF) Performance ({n_splits}-Fold CV) ---")
+print(f"PR-AUC  : {oof_pr_auc:.4f}")
+print(f"ROC-AUC : {oof_roc_auc:.4f}\n")
+print("Classification Report:")
+print(classification_report(y_union, oof_preds))
+
+# %%
+# To focus as explanatory device for integrating all pathway
 clf = LogisticRegression(
     l1_ratio=0.5,  # 0.5 = equal mix of L1 (Lasso) and L2 (Ridge)
     C=1,  # Inverse of regularization strength (smaller C = stronger penalty)
@@ -282,6 +326,24 @@ LE_count_tbl = pd.DataFrame({'SANGER_MODEL_ID':out_path_leading_edge_member_list
 tmp_le = y_union[y_union.gt(0)].index.tolist()
 tmp_ax = dose_data_tbl.query('DRUG_ID == @drug_id').assign(LE = lambda df: np.where(df.SANGER_MODEL_ID.isin(tmp_le),'Leading_Edge','Rest')).groupby('LE').AUC.plot.kde(legend=True,title='AUC')
 plt.show()
+
+# %%
+
+from tabpfn import TabPFNClassifier
+
+model = TabPFNClassifier()
+model.fit(out_path_leading_edge_score_tbl, y_union)
+nl_probs = model.predict_proba(out_path_leading_edge_score_tbl)
+
+precision, recall, _ = precision_recall_curve(y_union, nl_probs)
+pr_auc = auc(recall, precision)
+roc_auc = roc_auc_score(y_union, nl_probs)
+print(y_union.mean())
+
+print("\n--- PoC Model Performance ---")
+print(f"ROC-AUC: {roc_auc:.4f}")
+print(f"PR-AUC:  {pr_auc:.4f}")
+
 
 # %%
 

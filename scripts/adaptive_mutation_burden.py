@@ -221,14 +221,7 @@ src.integration.leading_edge.create_interactive_network_explorer(pos,agg_node_df
 tmp_drug_out_path_thresh = tmp_res.query('Pathway_Name in @out_path').loc[:,['Pathway_Name','Optimal_Burden_Threshold_Tau']]
 tmp_drug_out_path_excess_count_df = gene_set_collection_excess_count_df.loc[:,out_path]
 
-tmp_drug_out_path_excess_count_df.gt(tmp_drug_out_path_thresh.set_index('Pathway_Name').loc[tmp_drug_out_path_excess_count_df.columns.to_list(),'Optimal_Burden_Threshold_Tau'].to_numpy(),axis=1).any(axis=1).sum()
 
-
-tmp_drug_out_path_excess_count_df.lt(tmp_drug_out_path_thresh.set_index('Pathway_Name').loc[tmp_drug_out_path_excess_count_df.columns.to_list(),'Optimal_Burden_Threshold_Tau'].to_numpy(),axis=1).all(axis=1)
-# %%
-leading_edge_cell_lines_tbl = tmp_res.loc[:,['Pathway_Name','Min_mHG_P_Value','Optimal_Burden_Threshold_Tau','Leading_Edge_Cell_Lines']].query('Pathway_Name in @out_path').Leading_Edge_Cell_Lines.explode().value_counts().sort_values().reset_index().rename(columns={'Leading_Edge_Cell_Lines':'SANGER_MODEL_ID','count':'leading_count'})
-
-dose_data_tbl.query('DRUG_ID == @drug_id').loc[:,['SANGER_MODEL_ID','sensitivity_p','AUC']].merge(leading_edge_cell_lines_tbl,how='left').fillna(0).assign(in_lead = lambda df: df.leading_count.gt(61)).groupby('in_lead').agg(mp = ('AUC','mean'))
 # %%
 
 def compute_graph_recovery_score(tmp_cell_line,node_df,edge_df,excess_mutation_df):
@@ -251,10 +244,5 @@ def compute_graph_recovery_score(tmp_cell_line,node_df,edge_df,excess_mutation_d
 cell_line_list = tmp_drug_excess_mutation_count_tbl.sanger_model_id.unique().tolist()
 graph_score = [compute_graph_recovery_score(tmp_cell,agg_node_df,agg_edge_df,tmp_drug_excess_mutation_count_tbl) for tmp_cell in cell_line_list]
 
-# %%
-g_to_auc_tbl = pd.DataFrame({'SANGER_MODEL_ID':cell_line_list,'gscore':graph_score}).merge(dose_data_tbl.query('DRUG_ID == @drug_id').loc[:,['SANGER_MODEL_ID','AUC','sensitivity_p']],how='left').dropna()
 
-# %%
 
-tmp_ax = g_to_auc_tbl.plot.scatter(x='gscore',y='sensitivity_p',logy=True)
-plt.show()

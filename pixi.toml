@@ -30,3 +30,5 @@ plotly = ">=6.9.0,<7"
 [pypi-dependencies]
 fast-hdbscan = ">=0.3.0, <0.4"
 xlmhglite = ">=1.1.1, <2"
+tabpfn = ">=8.2.0, <9"
+tabpfn-extensions = { version = ">=0.5.0, <0.6", extras = ["interpretability"] }
