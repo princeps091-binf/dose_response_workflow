@@ -26,6 +26,7 @@ networkx = ">=3.6.1,<4"
 kneed = ">=0.8.6,<0.9"
 hilbertcurve = ">=2.0.5,<3"
 plotly = ">=6.9.0,<7"
+python-dotenv = ">=1.2.3,<2"
 
 [pypi-dependencies]
 fast-hdbscan = ">=0.3.0, <0.4"

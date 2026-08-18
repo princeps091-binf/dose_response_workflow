@@ -3,3 +3,4 @@
 !.pixi/config.toml
 data/
 img/
+.env

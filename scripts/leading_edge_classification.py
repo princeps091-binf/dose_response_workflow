@@ -80,7 +80,7 @@ N_vector = total_exome_loads.reindex(all_cells).fillna(0).values.reshape(-1, 1) 
 # Gefitinib = 1010
 #1 Trametinib = 1372 
 # Osimertinib = 1919 ->
-drug_id = 1010
+drug_id = 1372
 drug_name = dose_data_tbl.query('DRUG_ID == @drug_id').DRUG_NAME.iloc[0]
 tmp_drug_excess_mutation_count_tbl = src.mutation.gene_set_analysis.get_excess_mutation_count_matrix(drug_id,K_matrix,N_vector,dose_data_tbl,all_cells,all_genes)
 
@@ -97,6 +97,7 @@ tmp_res = src.mutation.gene_set_analysis.run_high_throughput_parallel_xlmhg(
     n_jobs = 8  
 )
 
+tmp_res = tmp_res.assign(x = lambda df: df.Min_mHG_P_Value.rank(pct=True),y=lambda df:-np.log10(df.Min_mHG_P_Value)).sort_values('x')
 # %%
 
 from kneed import KneeLocator, find_shape
@@ -111,12 +112,8 @@ out_path = kneed_tbl.query('x <= @kl.knee').Pathway_Name.to_list()
 tmp_ax = kneed_tbl.plot(x='x',y='y')
 tmp_ax.axvline(x=kl.knee, color="red", linestyle="--", linewidth=1.5, label="Knee Point")
 plt.show()
+
 # %%
-
-tmp_drug_out_path_excess_count_df = gene_set_collection_excess_count_df.loc[:,out_path]
-
-out_path_leading_edge_member_list = tmp_res.query('Pathway_Name in @out_path').loc[:,['Pathway_Name','Leading_Edge_Cell_Lines']].set_index('Pathway_Name').loc[tmp_drug_out_path_excess_count_df.columns,'Leading_Edge_Cell_Lines'].to_list()
-
 def compute_leading_edge_quantiles_vectorized(
     burdens_df: pd.DataFrame, 
     le_cell_lists: list[list[str]]
@@ -185,11 +182,36 @@ def compute_leading_edge_quantiles_vectorized(
 
 # %%
 
-out_path_leading_edge_score_tbl = compute_leading_edge_quantiles_vectorized(tmp_drug_out_path_excess_count_df,out_path_leading_edge_member_list)
+leading_edge_member_list = tmp_res.loc[:,['Pathway_Name','Leading_Edge_Cell_Lines']].set_index('Pathway_Name').loc[gene_set_collection_excess_count_df.columns,'Leading_Edge_Cell_Lines'].to_list()
+
+leading_edge_score_tbl = compute_leading_edge_quantiles_vectorized(gene_set_collection_excess_count_df,leading_edge_member_list)
 
 # %%
+tmp_path = "KEGG_ERBB_SIGNALING_PATHWAY"
+tmp_LE_cells_list = tmp_res.query('Pathway_Name == @tmp_path ').Leading_Edge_Cell_Lines.iloc[0]
+tmp_thresh = tmp_res.query('Pathway_Name == @tmp_path ').Optimal_Burden_Threshold_Tau.iloc[0]
+
+tmp_path_AUC_mut_tbl= (gene_set_collection_excess_count_df.loc[:,tmp_path]
+ .reset_index()
+ .merge(
+    dose_data_tbl.query('DRUG_ID == @drug_id').loc[:,['SANGER_MODEL_ID','AUC','sensitivity_p']],
+    left_on='sanger_model_id',
+    right_on='SANGER_MODEL_ID',
+    how='left'
+    )
+ .dropna()
+ .assign(LE = lambda df: np.where(df.sanger_model_id.isin(tmp_LE_cells_list),'red','grey'))
+                       )
+tmp_ax = (tmp_path_AUC_mut_tbl
+ .plot
+ .scatter(y='AUC',x=tmp_path,c='LE',s=50,alpha=0.1)
+ # .groupby('LE')
+ # .agg(m=(tmp_path,'mean'))
+ )
+plt.show()
+ # %%
 tmp_ax = (
-        out_path_leading_edge_score_tbl.sum(axis=1).sort_values().reset_index().rename(columns= {0:'score'}).merge(
+        leading_edge_score_tbl.sum(axis=1).sort_values().reset_index().rename(columns= {0:'score'}).merge(
 dose_data_tbl.query('DRUG_ID == @drug_id').loc[:,['SANGER_MODEL_ID','AUC','sensitivity_p']],
 left_on='sanger_model_id',
 right_on='SANGER_MODEL_ID',
@@ -200,6 +222,12 @@ how='left'
 .scatter(x='score',y='AUC')
 )
 plt.show()
+
+# %%
+
+from sklearn.model_selection import StratifiedKFold
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import precision_recall_curve, auc, roc_auc_score
 
 # %%
 
@@ -226,127 +254,206 @@ def augment_features_for_or_logic(F_df: pd.DataFrame, pathway_rank_df: pd.DataFr
     return F_augmented
 
 # %%
-cell_ids = tmp_drug_out_path_excess_count_df.index
-pathway_names = tmp_drug_out_path_excess_count_df.columns
-all_le_cells_set = set(c for sublist in out_path_leading_edge_member_list for c in sublist)
-LE_count_tbl = pd.DataFrame({'SANGER_MODEL_ID':out_path_leading_edge_member_list}).explode('SANGER_MODEL_ID').value_counts().reset_index().rename(columns={'count':'path_count'})
-LE_cells = LE_count_tbl.query('path_count > 0').SANGER_MODEL_ID.to_list()
-y_union = pd.Series(cell_ids.isin(LE_cells).astype(int), index=cell_ids)
 
-F_augmented_df = augment_features_for_or_logic(out_path_leading_edge_score_tbl,kneed_tbl)
-# -------------------------------------------------------------------------
-# 3. FIT LOGISTIC REGRESSION ON FULL COHORT
-# -------------------------------------------------------------------------
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import classification_report, roc_auc_score, precision_recall_curve, auc
-from sklearn.model_selection import StratifiedKFold
-# clf = LogisticRegression(
-#     l1_ratio=1,
-#     solver='liblinear',
-#     random_state=42
-# )
-# %%
-# 1. Initialize Stratified K-Fold Cross-Validation
 
-n_splits = 10
-skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-# Array to store Out-of-Fold (OOF) predicted probabilities
-oof_probs = np.zeros(len(y_union))
-for fold, (train_idx, val_idx) in enumerate(skf.split(F_augmented_df, y_union)):
-    # Split data
-    X_train, X_val = F_augmented_df.iloc[train_idx], F_augmented_df.iloc[val_idx]
-    y_train, y_val = y_union.iloc[train_idx], y_union.iloc[val_idx]
-    # Initialize ElasticNet Logistic Regression
-    clf = LogisticRegression(
-        l1_ratio=0.5,  # Equal mix of L1 (Lasso) and L2 (Ridge)
-        C=1.0,         # Inverse regularization strength
-        solver="saga",
-        max_iter=10000,
-        random_state=42 + fold  # Vary random state per fold
-    )
-    # Fit model on training fold
-    clf.fit(X_train, y_train)
-    # Predict probabilities on validation fold
-    oof_probs[val_idx] = clf.predict_proba(X_val)[:, 1]
-
-# 3. Compute Out-of-Fold (OOF) Evaluation Metrics
-oof_preds = (oof_probs >= 0.5).astype(int)
+def compute_auprg(y_true, y_scores):
+    """Calcule l'Aire Sous la Courbe Precision-Recall Gain (AUPRG) selon Flach & Kull (2015).
+    y_true   : array-like, étiquettes réelles (0 ou 1)
+    y_scores : array-like, probabilités ou scores prédits par le modèle
+    """
+    y_true = np.asarray(y_true)
+    y_scores = np.asarray(y_scores)
+    # 1. Calcul de la prévalence (pi)
+    pi = np.mean(y_true)
+    if pi == 0 or pi == 1:
+        return 0.0  # Cas triviaux
+    # 2. Obtenir la courbe PR standard de Scikit-Learn
+    precision, recall, _ = precision_recall_curve(y_true, y_scores)
+    # Inverser pour avoir recall croissant (de 0 à 1)
+    precision = precision[::-1]
+    recall = recall[::-1]
+    # 3. Formules PR-Gain
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rg = (recall - pi) / ((1 - pi) * recall)
+        pg = (precision - pi) / ((1 - pi) * precision)
+    # 4. Conserver uniquement les points où Recall Gain > 0 et Precision Gain > 0
+    # (Ou effectuer l'interpolation linéaire vers l'origine (0,0))
+    valid_mask = (recall > pi) & (precision > pi)
+    rg_valid = rg[valid_mask]
+    pg_valid = pg[valid_mask]
+    if len(rg_valid) == 0:
+        return 0.0  # Aucun gain par rapport au hasard
+    # 5. Ancrer explicitement la courbe à l'origine (0, 0)
+    rg_final = np.concatenate(([0.0], rg_valid))
+    pg_final = np.concatenate(([0.0], pg_valid))
+    # 6. S'assurer que les points sont strictement croissants sur Recall Gain
+    sort_idx = np.argsort(rg_final)
+    rg_sorted = rg_final[sort_idx]
+    pg_sorted = pg_final[sort_idx]
+    # 7. Intégration numérique par la méthode des trapèzes
+    # Utiliser np.trapezoid (NumPy 2.0+) ou np.trapz (versions antérieures)
+    auprg = np.trapezoid(pg_sorted, rg_sorted)
+    return float(np.clip(auprg, 0.0, 1.0))
 
 # %%
-# Precision-Recall AUC (PR-AUC)
-precision, recall, _ = precision_recall_curve(y_union, oof_probs)
-oof_pr_auc = auc(recall, precision)
-
-# ROC-AUC
-oof_roc_auc = roc_auc_score(y_union, oof_probs)
-
-print(f"--- Out-of-Fold (OOF) Performance ({n_splits}-Fold CV) ---")
-print(f"PR-AUC  : {oof_pr_auc:.4f}")
-print(f"ROC-AUC : {oof_roc_auc:.4f}\n")
-print("Classification Report:")
-print(classification_report(y_union, oof_preds))
+pr_auc_list = []
+roc_auc_list = []
+base_rate_list = []
+auprg_list = []
+thresh_span =np.concatenate((tmp_res.query('x < @kl.knee').x.to_numpy(), np.linspace(kl.knee,0.5,21)))
+n_splits = 5
+for tmp_thresh in thresh_span:
+    out_path = tmp_res.query('x <= @tmp_thresh').Pathway_Name.to_list()
+    tmp_drug_out_path_excess_count_df = gene_set_collection_excess_count_df.loc[:,out_path]
+    out_path_leading_edge_score_tbl = leading_edge_score_tbl.loc[:,out_path]
+    out_path_leading_edge_member_list = tmp_res.query('Pathway_Name in @out_path').Leading_Edge_Cell_Lines.explode().unique().tolist()
+    cell_ids = tmp_drug_out_path_excess_count_df.index
+    pathway_names = tmp_drug_out_path_excess_count_df.columns
+    all_le_cells_set = set(c for sublist in out_path_leading_edge_member_list for c in sublist)
+    LE_count_tbl = pd.DataFrame({'SANGER_MODEL_ID':out_path_leading_edge_member_list}).explode('SANGER_MODEL_ID').value_counts().reset_index().rename(columns={'count':'path_count'})
+    LE_cells = LE_count_tbl.query('path_count > 0').SANGER_MODEL_ID.to_list()
+    y_union = pd.Series(cell_ids.isin(LE_cells).astype(int), index=cell_ids)
+    F_augmented_df = augment_features_for_or_logic(out_path_leading_edge_score_tbl,kneed_tbl)
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    # Array to store Out-of-Fold (OOF) predicted probabilities
+    base_rate_list.append(y_union.mean())
+    oof_probs = np.zeros(len(y_union))
+    for fold, (train_idx, val_idx) in enumerate(skf.split(F_augmented_df, y_union)):
+        # Split data
+        X_train, X_val = F_augmented_df.iloc[train_idx], F_augmented_df.iloc[val_idx]
+        y_train, y_val = y_union.iloc[train_idx], y_union.iloc[val_idx]
+        # Initialize ElasticNet Logistic Regression
+        # clf = LogisticRegression(
+        #     l1_ratio=0.5,  # Equal mix of L1 (Lasso) and L2 (Ridge)
+        #     C=1.0,         # Inverse regularization strength
+        #     solver="saga",
+        #     max_iter=10000,
+        #     random_state=42 + fold  # Vary random state per fold
+        # )
+        # Initialize Lasso Logistic Regression
+        clf = LogisticRegression(
+                    l1_ratio=1,          # Pure L1 (Lasso) regularization
+                    solver="liblinear",    # Coordinate descent solver for small/medium sparse models
+                    max_iter=1000,         # liblinear usually converges quickly (1000 is safe)
+                    random_state=42 + fold  # Reproducibility per fold
+                )
+        # Fit model on training fold
+        clf.fit(X_train, y_train)
+        # Predict probabilities on validation fold
+        oof_probs[val_idx] = clf.predict_proba(X_val)[:, 1]
+    # 3. Compute Out-of-Fold (OOF) Evaluation Metrics
+    oof_preds = (oof_probs >= 0.5).astype(int)
+    # Precision-Recall AUC (PR-AUC)
+    precision, recall, _ = precision_recall_curve(y_union, oof_probs)
+    oof_pr_auc = auc(recall, precision)
+    # ROC-AUC
+    oof_roc_auc = roc_auc_score(y_union, oof_probs)
+    oof_auprg = compute_auprg(y_union,oof_preds)
+    pr_auc_list.append(oof_pr_auc)
+    roc_auc_list.append(oof_roc_auc)
+    auprg_list.append(oof_auprg)
+    print(f"{tmp_thresh:.2f} PR-AUC  : {oof_pr_auc:.4f}")
+    print(f"{tmp_thresh:.2f} ROC-AUC : {oof_roc_auc:.4f}\n")
 
 # %%
-# To focus as explanatory device for integrating all pathway
-clf = LogisticRegression(
-    l1_ratio=0.5,  # 0.5 = equal mix of L1 (Lasso) and L2 (Ridge)
-    C=1,  # Inverse of regularization strength (smaller C = stronger penalty)
-    solver="saga",
-    max_iter=10000,  # SAGA requires higher max_iter to converge
-    random_state=42,
-)
-# clf.fit(out_path_leading_edge_score_tbl, y_union)
-# y_probs = clf.predict_proba(out_path_leading_edge_score_tbl)[:, 1]
 
+perf_summary_tbl = pd.DataFrame({'thresh':thresh_span,'ROC':roc_auc_list,'PR':pr_auc_list,'base_rate':base_rate_list,'auprg':auprg_list}).assign(norm_pr_auc = lambda df: (df.PR - df.base_rate)/(1-df.base_rate))
 
-clf.fit(F_augmented_df, y_union)
-y_probs = clf.predict_proba(F_augmented_df)[:, 1]
-# %%
-# -------------------------------------------------------------------------
-# 4. EVALUATE PROOF-OF-CONCEPT METRICS
-# -------------------------------------------------------------------------
-precision, recall, _ = precision_recall_curve(y_union, y_probs)
-pr_auc = auc(recall, precision)
-roc_auc = roc_auc_score(y_union, y_probs)
-print(y_union.mean())
-
-print("\n--- PoC Model Performance ---")
-print(f"ROC-AUC: {roc_auc:.4f}")
-print(f"PR-AUC:  {pr_auc:.4f}")
+tmp_ax = perf_summary_tbl.plot('thresh','norm_pr_auc')
+plt.show()
 
 # %%
 # Extract non-zero learned coefficients (Selected Pathways)
-coef_df = pd.DataFrame({
-    'Pathway': F_augmented_df.columns,
-    'Beta': clf.coef_[0],
-    'Odds_Ratio': np.exp(clf.coef_[0])
-}).sort_values(by='Beta', ascending=False)
+auprg_thresh = perf_summary_tbl.norm_pr_auc.max()
+tmp_thresh = perf_summary_tbl.query('norm_pr_auc >= @auprg_thresh').sort_values('thresh',ascending=False).thresh.iloc[0]
+out_path = tmp_res.query('x <= @tmp_thresh').Pathway_Name.to_list()
 
-LE_count_tbl = pd.DataFrame({'SANGER_MODEL_ID':out_path_leading_edge_member_list}).explode('SANGER_MODEL_ID').value_counts().reset_index().rename(columns={'count':'path_count'})
-tmp_le = y_union[y_union.gt(0)].index.tolist()
+tmp_le = tmp_res.query('Pathway_Name in @out_path').Leading_Edge_Cell_Lines.explode().unique()
+
 tmp_ax = dose_data_tbl.query('DRUG_ID == @drug_id').assign(LE = lambda df: np.where(df.SANGER_MODEL_ID.isin(tmp_le),'Leading_Edge','Rest')).groupby('LE').AUC.plot.kde(legend=True,title='AUC')
 plt.show()
 
 # %%
+out_path_leading_edge_member_list = tmp_res.query('Pathway_Name in @out_path').Leading_Edge_Cell_Lines.to_list()
 
+LE_count_tbl = pd.DataFrame({'SANGER_MODEL_ID':out_path_leading_edge_member_list}).explode('SANGER_MODEL_ID').value_counts().reset_index().rename(columns={'count':'path_count'})
+# %%
+import torch
+print(torch.cuda.is_available())       # True if CUDA GPU is available
+print(torch.cuda.get_device_name(0))   # GPU name
+
+# %%
 from tabpfn import TabPFNClassifier
+import os
+from dotenv import load_dotenv
 
-model = TabPFNClassifier()
-model.fit(out_path_leading_edge_score_tbl, y_union)
-nl_probs = model.predict_proba(out_path_leading_edge_score_tbl)
+# Get the directory of the current script
+script_dir = os.path.dirname(os.path.abspath(__name__))
+env_path = os.path.join(script_dir, '.env')
 
-precision, recall, _ = precision_recall_curve(y_union, nl_probs)
-pr_auc = auc(recall, precision)
-roc_auc = roc_auc_score(y_union, nl_probs)
-print(y_union.mean())
+# Load the specific path
+load_dotenv(dotenv_path=env_path)
+load_dotenv()
+# %%
+pr_auc_list = []
+roc_auc_list = []
+base_rate_list = []
+n_splits = 5
+for tmp_thresh in thresh_span:
+    out_path = kneed_tbl.query('x <= @tmp_thresh').Pathway_Name.to_list()
+    tmp_drug_out_path_excess_count_df = gene_set_collection_excess_count_df.loc[:,out_path]
+    out_path_leading_edge_score_tbl = leading_edge_score_tbl.loc[:,out_path]
+    out_path_leading_edge_member_list = tmp_res.query('Pathway_Name in @out_path').Leading_Edge_Cell_Lines.explode().unique().tolist()
+    cell_ids = tmp_drug_out_path_excess_count_df.index
+    pathway_names = tmp_drug_out_path_excess_count_df.columns
+    all_le_cells_set = set(c for sublist in out_path_leading_edge_member_list for c in sublist)
+    LE_count_tbl = pd.DataFrame({'SANGER_MODEL_ID':out_path_leading_edge_member_list}).explode('SANGER_MODEL_ID').value_counts().reset_index().rename(columns={'count':'path_count'})
+    LE_cells = LE_count_tbl.query('path_count > 0').SANGER_MODEL_ID.to_list()
+    y_union = pd.Series(cell_ids.isin(LE_cells).astype(int), index=cell_ids)
+    base_rate_list.append(y_union.mean())
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    # Array to store Out-of-Fold (OOF) predicted probabilities
+    oof_probs = np.zeros(len(y_union))
+    for fold, (train_idx, val_idx) in enumerate(skf.split(out_path_leading_edge_score_tbl, y_union)):
+        # Split data
+        X_train, X_val = out_path_leading_edge_score_tbl.iloc[train_idx], out_path_leading_edge_score_tbl.iloc[val_idx]
+        y_train, y_val = y_union.iloc[train_idx], y_union.iloc[val_idx]
+        # Initialize ElasticNet Logistic Regression
+        model = TabPFNClassifier()
+        model.fit(X_train, y_train)
+        oof_probs[val_idx] = model.predict_proba(X_val)[:,1]
+        # Fit model on training fold
+    # 3. Compute Out-of-Fold (OOF) Evaluation Metrics
+    # Precision-Recall AUC (PR-AUC)
+    precision, recall, _ = precision_recall_curve(y_union, oof_probs)
+    oof_pr_auc = auc(recall, precision)
+    # ROC-AUC
+    oof_roc_auc = roc_auc_score(y_union, oof_probs)
+    print(f"{tmp_thresh:.2f} PR-AUC  : {oof_pr_auc:.4f}")
+    print(f"{tmp_thresh:.2f} ROC-AUC : {oof_roc_auc:.4f}\n")
+    pr_auc_list.append(oof_pr_auc)
+    roc_auc_list.append(oof_roc_auc)
 
-print("\n--- PoC Model Performance ---")
-print(f"ROC-AUC: {roc_auc:.4f}")
-print(f"PR-AUC:  {pr_auc:.4f}")
+# %%
+
+perf_summary_tbl = pd.DataFrame({'thresh':thresh_span,'ROC':roc_auc_list,'PR':pr_auc_list,'base_rate':base_rate_list}).assign(norm_pr_auc = lambda df: (df.PR - df.base_rate)/(1-df.base_rate))
+
+tmp_ax = perf_summary_tbl.plot('thresh','norm_pr_auc')
+plt.show()
+
 
 
 # %%
 
+from tabpfn_extensions.interpretability.shapiq import get_tabpfn_imputation_explainer
+explainer = get_tabpfn_imputation_explainer(model=model, data=out_path_leading_edge_score_tbl)
+
+sv = explainer.explain(out_path_leading_edge_score_tbl.iloc[2:3].values, budget=128)
+print(sv)              # top interactions ranked by magnitude
+sv.plot_waterfall()    # waterfall plot showing additive co
+
+# %%
+# Regression potential
 
 tmp_ax =( dose_data_tbl
          .query('DRUG_ID == @drug_id')
