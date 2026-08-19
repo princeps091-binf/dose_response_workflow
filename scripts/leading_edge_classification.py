@@ -80,7 +80,7 @@ N_vector = total_exome_loads.reindex(all_cells).fillna(0).values.reshape(-1, 1) 
 # Gefitinib = 1010
 #1 Trametinib = 1372 
 # Osimertinib = 1919 ->
-drug_id = 1372
+drug_id = 1080
 drug_name = dose_data_tbl.query('DRUG_ID == @drug_id').DRUG_NAME.iloc[0]
 tmp_drug_excess_mutation_count_tbl = src.mutation.gene_set_analysis.get_excess_mutation_count_matrix(drug_id,K_matrix,N_vector,dose_data_tbl,all_cells,all_genes)
 
@@ -348,18 +348,18 @@ for tmp_thresh in thresh_span:
     oof_pr_auc = auc(recall, precision)
     # ROC-AUC
     oof_roc_auc = roc_auc_score(y_union, oof_probs)
-    oof_auprg = compute_auprg(y_union,oof_preds)
+    oof_auprg = compute_auprg(y_union,oof_probs)
     pr_auc_list.append(oof_pr_auc)
     roc_auc_list.append(oof_roc_auc)
     auprg_list.append(oof_auprg)
     print(f"{tmp_thresh:.2f} PR-AUC  : {oof_pr_auc:.4f}")
     print(f"{tmp_thresh:.2f} ROC-AUC : {oof_roc_auc:.4f}\n")
-
+    print(f"{tmp_thresh:.2f} AUPRG : {oof_auprg:.4f}\n")
 # %%
 
 perf_summary_tbl = pd.DataFrame({'thresh':thresh_span,'ROC':roc_auc_list,'PR':pr_auc_list,'base_rate':base_rate_list,'auprg':auprg_list}).assign(norm_pr_auc = lambda df: (df.PR - df.base_rate)/(1-df.base_rate))
 
-tmp_ax = perf_summary_tbl.plot('thresh','norm_pr_auc')
+tmp_ax = perf_summary_tbl.plot('thresh','auprg')
 plt.show()
 
 # %%
@@ -398,6 +398,7 @@ load_dotenv()
 pr_auc_list = []
 roc_auc_list = []
 base_rate_list = []
+auprg_list = []
 n_splits = 5
 for tmp_thresh in thresh_span:
     out_path = kneed_tbl.query('x <= @tmp_thresh').Pathway_Name.to_list()
@@ -429,22 +430,170 @@ for tmp_thresh in thresh_span:
     oof_pr_auc = auc(recall, precision)
     # ROC-AUC
     oof_roc_auc = roc_auc_score(y_union, oof_probs)
+    oof_auprg = compute_auprg(y_union,oof_probs)
     print(f"{tmp_thresh:.2f} PR-AUC  : {oof_pr_auc:.4f}")
     print(f"{tmp_thresh:.2f} ROC-AUC : {oof_roc_auc:.4f}\n")
     pr_auc_list.append(oof_pr_auc)
     roc_auc_list.append(oof_roc_auc)
+    auprg_list.append(oof_auprg)
+    print(f"{tmp_thresh:.2f} AUPRG : {oof_auprg:.4f}\n")
 
 # %%
 
-perf_summary_tbl = pd.DataFrame({'thresh':thresh_span,'ROC':roc_auc_list,'PR':pr_auc_list,'base_rate':base_rate_list}).assign(norm_pr_auc = lambda df: (df.PR - df.base_rate)/(1-df.base_rate))
+perf_summary_tbl = pd.DataFrame({'thresh':thresh_span,'ROC':roc_auc_list,'PR':pr_auc_list,'base_rate':base_rate_list,'auprg':auprg_list}).assign(norm_pr_auc = lambda df: (df.PR - df.base_rate)/(1-df.base_rate))
 
-tmp_ax = perf_summary_tbl.plot('thresh','norm_pr_auc')
+tmp_ax = perf_summary_tbl.plot('thresh','auprg')
 plt.show()
 
+# %%
 
+import optuna
+# 1. Define bounds for tmp_thresh based on your original thresh_span
+thresh_min = float(thresh_span.min())
+thresh_max = float(thresh_span.max())
+
+def objective(trial):
+    # --- HYPERPARAMETER SAMPLING ---
+    # Sample tmp_thresh continuously between the bounds of thresh_span
+    tmp_thresh = trial.suggest_float("tmp_thresh", thresh_min, thresh_max)
+    # Sample l1_ratio between 0 (Pure L2) and 1 (Pure L1 / Lasso)
+    # l1_ratio = trial.suggest_float("l1_ratio", 0.0, 1.0)
+    # Optionally tune C (inverse regularization strength) alongside ElasticNet
+    C = trial.suggest_float("C", 1e-3, 10.0, log=True)
+# --- FEATURE SELECTION & TARGET CONSTRUCTION ---
+    out_path = tmp_res.query('x <= @tmp_thresh').Pathway_Name.to_list()
+# Prune search early if threshold selects zero pathways
+    if len(out_path) == 0:
+        return 0.0  # Return baseline low score
+    tmp_drug_out_path_excess_count_df = gene_set_collection_excess_count_df.loc[:, out_path]
+    out_path_leading_edge_score_tbl = leading_edge_score_tbl.loc[:, out_path]
+    out_path_leading_edge_member_list = (
+        tmp_res.query('Pathway_Name in @out_path')
+        .Leading_Edge_Cell_Lines.explode()
+        .unique()
+        .tolist()
+        )
+    cell_ids = tmp_drug_out_path_excess_count_df.index
+    LE_count_tbl = (
+        pd.DataFrame({'SANGER_MODEL_ID': out_path_leading_edge_member_list})
+        .explode('SANGER_MODEL_ID')
+        .value_counts()
+        .reset_index()
+        .rename(columns={'count': 'path_count'})
+    )
+    LE_cells = LE_count_tbl.query('path_count > 0').SANGER_MODEL_ID.to_list()
+    y_union = pd.Series(cell_ids.isin(LE_cells).astype(int), index=cell_ids)
+# Check for single-class targets in extreme threshold edge cases
+    if y_union.nunique() < 2:
+        return 0.0
+    F_augmented_df = augment_features_for_or_logic(out_path_leading_edge_score_tbl, tmp_res)
+# --- OUT-OF-FOLD (OOF) CROSS-VALIDATION ---
+    n_splits = 5
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    oof_probs = np.zeros(len(y_union))
+    for fold, (train_idx, val_idx) in enumerate(skf.split(F_augmented_df, y_union)):
+        X_train, X_val = F_augmented_df.iloc[train_idx], F_augmented_df.iloc[val_idx]
+        y_train, y_val = y_union.iloc[train_idx], y_union.iloc[val_idx]
+        clf = LogisticRegression(
+            l1_ratio=1,  # Equal mix of L1 (Lasso) and L2 (Ridge)
+            C=C,         # Inverse regularization strength
+            solver="liblinear",
+            max_iter=10000,
+            random_state=42 + fold  # Vary random state per fold
+        )
+        clf.fit(X_train, y_train)
+        oof_probs[val_idx] = clf.predict_proba(X_val)[:, 1]
+# --- OOF EVALUATION METRICS ---
+    # Compute AUPRG on continuous predicted probabilities (not binary oof_preds)
+    oof_auprg = compute_auprg(y_union, oof_probs)
+    # Store auxiliary metrics as trial user attributes for later retrieval
+    precision, recall, _ = precision_recall_curve(y_union, oof_probs)
+    trial.set_user_attr("oof_pr_auc", auc(recall, precision))
+    trial.set_user_attr("oof_roc_auc", roc_auc_score(y_union, oof_probs))
+    trial.set_user_attr("base_rate", float(y_union.mean()))
+    return oof_auprg
+
+# %%
+# --- EXECUTE OPTUNA STUDY ---
+optuna.logging.set_verbosity(optuna.logging.INFO)
+study = optuna.create_study(
+    direction="maximize",
+    sampler=optuna.samplers.TPESampler(seed=42)
+)
+
+study.optimize(objective, n_trials=50, timeout=1800)  # Adjust trials/timeout as needed
 
 # %%
 
+
+def objective(trial):
+    # --- HYPERPARAMETER SAMPLING ---
+    # Sample tmp_thresh continuously between the bounds of thresh_span
+    tmp_thresh = trial.suggest_float("tmp_thresh", thresh_min, thresh_max)
+# --- FEATURE SELECTION & TARGET CONSTRUCTION ---
+    out_path = tmp_res.query('x <= @tmp_thresh').Pathway_Name.to_list()
+# Prune search early if threshold selects zero pathways
+    if len(out_path) == 0:
+        return 0.0  # Return baseline low score
+    tmp_drug_out_path_excess_count_df = gene_set_collection_excess_count_df.loc[:, out_path]
+    out_path_leading_edge_score_tbl = leading_edge_score_tbl.loc[:, out_path]
+    out_path_leading_edge_member_list = (
+        tmp_res.query('Pathway_Name in @out_path')
+        .Leading_Edge_Cell_Lines.explode()
+        .unique()
+        .tolist()
+        )
+    cell_ids = tmp_drug_out_path_excess_count_df.index
+    LE_count_tbl = (
+        pd.DataFrame({'SANGER_MODEL_ID': out_path_leading_edge_member_list})
+        .explode('SANGER_MODEL_ID')
+        .value_counts()
+        .reset_index()
+        .rename(columns={'count': 'path_count'})
+    )
+    LE_cells = LE_count_tbl.query('path_count > 0').SANGER_MODEL_ID.to_list()
+    y_union = pd.Series(cell_ids.isin(LE_cells).astype(int), index=cell_ids)
+# Check for single-class targets in extreme threshold edge cases
+    if y_union.nunique() < 2:
+        return 0.0
+    F_augmented_df = augment_features_for_or_logic(out_path_leading_edge_score_tbl, tmp_res)
+# --- OUT-OF-FOLD (OOF) CROSS-VALIDATION ---
+    n_splits = 5
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    oof_probs = np.zeros(len(y_union))
+    for fold, (train_idx, val_idx) in enumerate(skf.split(F_augmented_df, y_union)):
+        X_train, X_val = F_augmented_df.iloc[train_idx], F_augmented_df.iloc[val_idx]
+        y_train, y_val = y_union.iloc[train_idx], y_union.iloc[val_idx]
+        model = TabPFNClassifier()
+        model.fit(X_train, y_train)
+        oof_probs[val_idx] = model.predict_proba(X_val)[:,1]
+# --- OOF EVALUATION METRICS ---
+    # Compute AUPRG on continuous predicted probabilities (not binary oof_preds)
+    oof_auprg = compute_auprg(y_union, oof_probs)
+    # Store auxiliary metrics as trial user attributes for later retrieval
+    precision, recall, _ = precision_recall_curve(y_union, oof_probs)
+    trial.set_user_attr("oof_pr_auc", auc(recall, precision))
+    trial.set_user_attr("oof_roc_auc", roc_auc_score(y_union, oof_probs))
+    trial.set_user_attr("base_rate", float(y_union.mean()))
+    return oof_auprg
+
+# %%
+# --- EXECUTE OPTUNA STUDY ---
+optuna.logging.set_verbosity(optuna.logging.INFO)
+study = optuna.create_study(
+    direction="maximize",
+    sampler=optuna.samplers.TPESampler(seed=42)
+)
+
+study.optimize(objective, n_trials=50, timeout=1800)  # Adjust trials/timeout as needed
+
+# %%
+
+print(f"Best OOF AUPRG   : {study.best_value:.4f}")
+print(f"Best tmp_thresh  : {study.best_params['tmp_thresh']:.4f}")
+print(f"Associated PR-AUC: {study.best_trial.user_attrs['oof_pr_auc']:.4f}")
+print(f"Associated ROC-AUC: {study.best_trial.user_attrs['oof_roc_auc']:.4f}")
+# %%
 from tabpfn_extensions.interpretability.shapiq import get_tabpfn_imputation_explainer
 explainer = get_tabpfn_imputation_explainer(model=model, data=out_path_leading_edge_score_tbl)
 
