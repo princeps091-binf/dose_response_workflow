@@ -27,8 +27,10 @@ reload(src.integration.leading_edge)
 
 class OutOfFoldEnsemble:
     """Wraps K fold models to predict averaged out-of-fold probabilities on new data."""
-    def __init__(self, models):
+    def __init__(self, models, optuna_params, coef_df):
         self.models = models
+        self.optuna = optuna_params
+        self.coef_df = coef_df
     def predict_proba(self, X):
         # Gather predicted positive-class probabilities from each fold model
         fold_probs = np.column_stack([model.predict_proba(X)[:, 1] for model in self.models])
@@ -38,6 +40,7 @@ class OutOfFoldEnsemble:
         return np.column_stack([1 - mean_probs, mean_probs])
     def predict(self, X, threshold=0.5):
         return (self.predict_proba(X)[:, 1] >= threshold).astype(int)
+
 
 
 
@@ -192,14 +195,18 @@ def compute_leading_edge_quantiles_vectorized(
     return pd.DataFrame(F, index=cell_ids, columns=pathway_names)
 
 # %%
-leading_edge_member_list = tmp_res.loc[:,['Pathway_Name','Leading_Edge_Cell_Lines']].set_index('Pathway_Name').loc[gene_set_collection_excess_count_df.columns,'Leading_Edge_Cell_Lines'].to_list()
-
-leading_edge_score_tbl = compute_leading_edge_quantiles_vectorized(gene_set_collection_excess_count_df,leading_edge_member_list)
-
 import joblib
 best_ensemble_path = f"./data/tmp_res/logit_ensemble_drug_{drug_id}.joblib"
 
 best_ensemble = joblib.load(best_ensemble_path)
+
+
+# %%
+leading_edge_member_list = tmp_res.loc[:,['Pathway_Name','Leading_Edge_Cell_Lines']].set_index('Pathway_Name').loc[gene_set_collection_excess_count_df.columns,'Leading_Edge_Cell_Lines'].to_list()
+
+
+
+leading_edge_score_tbl = compute_leading_edge_quantiles_vectorized(gene_set_collection_excess_count_df,leading_edge_member_list)
 
 # %%
 def augment_features_for_or_logic(F_df: pd.DataFrame, pathway_rank_df: pd.DataFrame) -> pd.DataFrame:
@@ -225,7 +232,32 @@ def augment_features_for_or_logic(F_df: pd.DataFrame, pathway_rank_df: pd.DataFr
     return F_augmented
 
 # %%
-# TODO: All dependencies not resolved !!!
+tmp_thresh = best_ensemble.optuna['tmp_thresh']
+out_path = tmp_res.query('x <= @tmp_thresh').Pathway_Name.to_list()
+tmp_drug_out_path_excess_count_df = gene_set_collection_excess_count_df.loc[:, out_path]
+out_path_leading_edge_score_tbl = leading_edge_score_tbl.loc[:, out_path]
+out_path_leading_edge_member_list = (
+    tmp_res.query('Pathway_Name in @out_path')
+    .Leading_Edge_Cell_Lines.explode()
+    .unique()
+    .tolist()
+)
+
+cell_ids = tmp_drug_out_path_excess_count_df.index
+
+LE_count_tbl = (
+    tmp_res.query('Pathway_Name in @out_path')
+    .Leading_Edge_Cell_Lines.explode()
+    .value_counts()
+    .reset_index()
+    .rename(columns={'count': 'path_count'})
+)
+
+LE_cells = LE_count_tbl.query('path_count > 0').Leading_Edge_Cell_Lines.to_list()
+y_union = pd.Series(cell_ids.isin(LE_cells).astype(int), index=cell_ids)
+
+F_augmented_df = augment_features_for_or_logic(out_path_leading_edge_score_tbl, tmp_res)
+
 
 new_predictions = best_ensemble.predict_proba(F_augmented_df)[:, 1]
 
@@ -235,9 +267,107 @@ tmp_ax = optim_pred_df.plot.scatter(x='proba',y='LE',alpha=0.1)
 plt.show()
 
 # %%
+credible_LE_cells_list = optim_pred_df.query('proba > 0.5 and LE ==1').sanger_model_id.unique()
 
 
-optim_pred_df = optim_pred_df.merge(
-        dose_data_tbl.query('DRUG_ID == @drug_id').loc[:,['SANGER_MODEL_ID','AUC','sensitivity_p']].rename(columns={'SANGER_MODEL_ID':'sanger_model_id'})
-        )
+summary_coefs = pd.DataFrame({
+    'mean_coef': best_ensemble.coef_df.mean(axis=0),
+    'min_coef': best_ensemble.coef_df.min(axis=0),
+    'max_coef': best_ensemble.coef_df.max(axis=0),
+    'selection_freq': (best_ensemble.coef_df != 0).mean(axis=0)
+}).sort_values(by='selection_freq', ascending=False)
+model_path_to_keep_list = summary_coefs.query('selection_freq > 0.5').index.tolist()
+# %%
+gene_in_optim_model_list = list(set().union(*(gene_set_to_use_dict[k] for k in model_path_to_keep_list if k in gene_set_to_use_dict)))
+
+model_gene_set_dict = {k: gene_set_to_use_dict[k] for k in model_path_to_keep_list if k in gene_set_to_use_dict}
+
+out_path = model_gene_set_dict.keys()
+# %%
+
+
+tmp_ax = dose_data_tbl.query('DRUG_ID == @drug_id').assign(leading_edge = lambda df: df.SANGER_MODEL_ID.isin(credible_LE_cells_list)).groupby('leading_edge').AUC.plot.kde(legend=True)
+
+plt.show()
+
+# %%
+
+agg_edge_df_list = []
+agg_node_df_list = []
+
+for tmp_gene_set_name in out_path:
+    print(tmp_gene_set_name)
+    tmp_gene_set = gene_set_to_use_dict[tmp_gene_set_name]
+    tmp_tot_gene_set_leading_edge_list = tmp_res.query('Pathway_Name == @tmp_gene_set_name').Leading_Edge_Cell_Lines.iloc[0]
+    tmp_gene_set_leading_edge_list = list(set(credible_LE_cells_list).intersection(tmp_tot_gene_set_leading_edge_list))
+    node_df, edge_df = src.integration.leading_edge.construct_leading_edge_network(tmp_gene_set,tmp_gene_set_leading_edge_list,tmp_drug_excess_mutation_count_tbl)
+    agg_edge_df_list.append(edge_df.assign(Pathway_Name = tmp_gene_set_name))
+    agg_node_df_list.append(node_df.assign(Pathway_Name = tmp_gene_set_name))
+
+
+# %%
+
+obs_paths_list = pd.concat(agg_node_df_list).Pathway_Name.unique()
+agg_node_df, agg_edge_df = src.integration.leading_edge.aggregate_pathway_networks_probabilistic_product(agg_node_df_list,agg_edge_df_list,obs_paths_list)
+
+tmp_ax = agg_edge_df.assign(pr = lambda df: df.Consolidated_Edge_Weight.rank(pct=True)).plot(x='pr',y='Consolidated_Edge_Weight')
+plt.show()
+
+
+agg_G =  nx.from_pandas_edgelist(
+        agg_edge_df.loc[:,['Source','Target','Consolidated_Edge_Weight']].rename(columns={'Consolidated_Edge_Weight':'weight'}), 
+    source='Source', 
+    target='Target', 
+    edge_attr='weight' 
+)
+
+# %%
+pos = src.integration.leading_edge.spectral_hilbert_layout(agg_G, gap_size=4)
+
+# Plotting the result
+
+exi,eyi,ezi = src.integration.leading_edge.generate_edge_contour_matrices(pos,agg_G,pd.DataFrame(pos).iloc[0,:].max(),resolution=500)
+
+# %%
+# interactive form for this visualisation using plotly
+
+src.integration.leading_edge.create_interactive_network_explorer(pos,agg_node_df,exi,eyi,ezi,output_html_path=f'./img/ML_{drug_name}_c2_network.html')
+
+
+# %%
+node_size_dict = (agg_node_df.loc[:,['Gene','Consolidated_Intensity']].set_index('Gene').to_dict())['Consolidated_Intensity']
+fig, ax = plt.subplots(figsize=(13, 12))  # Dark tech background
+ax.set_facecolor('#090d16')
+nx.draw_networkx_nodes(agg_G, pos, node_size=[10 ** ( node_size_dict[node]) for node in agg_G.nodes()], node_color='#4D96FF')
+nx.draw_networkx_edges(agg_G, pos, alpha=0.5, edge_color='grey')
+nx.draw_networkx_labels(agg_G, pos, font_size=10, font_color='black')
+contour_filled = ax.contourf(exi, eyi, ezi, levels=20, cmap='plasma', alpha=0.8, zorder=1)
+ax.set_xlim(-1, pd.DataFrame.from_dict(pos,orient='index',columns=['x','y']).x.max() + 1)
+ax.set_ylim(-1, pd.DataFrame.from_dict(pos,orient='index',columns=['x','y']).y.max() + 1)
+plt.title("Spectral (Fiedler Vector) Hilbert Layout")
+plt.axis('off')
+plt.show()
+
+
+
+
+# %%
+(
+tmp_drug_excess_mutation_count_tbl
+.query('~(sanger_model_id in @credible_LE_cells_list)')
+.query('gene in @gene_in_optim_model_list')
+.merge(
+    pd.DataFrame(model_gene_set_dict.items()).explode(1).rename(columns={0:'Pathway',1:'gene'})
+    .merge(best_ensemble.coef_df.iloc[0,:]
+           .reset_index()
+           .rename(columns={'index':'Pathway',0:'coef'}),how='left')
+)
+.assign(score = lambda df: df.coef * df.excess_mutation_count)
+.groupby(['gene','sanger_model_id'])
+.agg(weight = ('score','sum'))
+.sort_values('weight',ascending=True)
+.head(20)
+)
+
+# %%
 

@@ -1,21 +1,31 @@
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 from importlib import reload
 from scipy.stats import beta, hypergeom
+import networkx as nx
+import itertools
 import src.utils.io 
 import src.mutation.gene_set_analysis
 import src.dose_response.detect_response
 import src.integration.gene_burden
 import src.integration.leading_edge
 
+from sklearn.model_selection import StratifiedKFold
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import precision_recall_curve, auc, roc_auc_score
+
 reload(src.integration.gene_burden)
 reload(src.mutation.gene_set_analysis)
 reload(src.dose_response.detect_response)
 reload(src.utils.io)
 reload(src.integration.leading_edge)
+
 # %%
+
+
 vcf_folder = Path("/home/vipink/Documents/dose_response_workflow/data/omics/mutations_wes_vcf_20250226/")
 vcf_file_list = list(vcf_folder.glob("*.gz"))
 
@@ -81,13 +91,12 @@ N_vector = total_exome_loads.reindex(all_cells).fillna(0).values.reshape(-1, 1) 
 drug_id = 1372
 drug_name = dose_data_tbl.query('DRUG_ID == @drug_id').DRUG_NAME.iloc[0]
 tmp_drug_excess_mutation_count_tbl = src.mutation.gene_set_analysis.get_excess_mutation_count_matrix(drug_id,K_matrix,N_vector,dose_data_tbl,all_cells,all_genes)
+tmp_drug_excess_mutation_count_mat= tmp_drug_excess_mutation_count_tbl.pivot(index="sanger_model_id", columns="gene", values="excess_mutation_count")
+tmp_drug_excess_mutation_count_mat = tmp_drug_excess_mutation_count_mat.fillna(0)
 
-
-gene_set_collection_excess_count_df = src.mutation.gene_set_analysis.compute_all_pathway_burdens_vectorized(tmp_drug_excess_mutation_count_tbl,all_cells,all_genes,gene_set_to_use_dict)
-
-
+# %%
 tmp_res = src.mutation.gene_set_analysis.run_high_throughput_parallel_xlmhg(
-    pathway_burden_df = gene_set_collection_excess_count_df,   
+    pathway_burden_df = tmp_drug_excess_mutation_count_mat,   
     drug_sensitivity_df = dose_data_tbl.query('DRUG_ID == @drug_id'), 
     n_burden_steps = 20,
     auc_col = 'sensitivity_p',
@@ -165,11 +174,12 @@ def compute_leading_edge_quantiles_vectorized(
     return pd.DataFrame(F, index=cell_ids, columns=pathway_names)
 
 # %%
-leading_edge_member_list = tmp_res.loc[:,['Pathway_Name','Leading_Edge_Cell_Lines']].set_index('Pathway_Name').loc[gene_set_collection_excess_count_df.columns,'Leading_Edge_Cell_Lines'].to_list()
+leading_edge_member_list = tmp_res.loc[:,['Pathway_Name','Leading_Edge_Cell_Lines']].set_index('Pathway_Name').loc[:,'Leading_Edge_Cell_Lines'].to_list()
 
-leading_edge_score_tbl = compute_leading_edge_quantiles_vectorized(gene_set_collection_excess_count_df,leading_edge_member_list)
+leading_edge_score_tbl = compute_leading_edge_quantiles_vectorized(tmp_drug_excess_mutation_count_mat.loc[:,tmp_res.Pathway_Name.to_list()],leading_edge_member_list)
 
 # %%
+
 from sklearn.model_selection import StratifiedKFold
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import precision_recall_curve, auc, roc_auc_score
@@ -240,25 +250,9 @@ def compute_auprg(y_true, y_scores):
     auprg = np.trapezoid(pg_sorted, rg_sorted)
     return float(np.clip(auprg, 0.0, 1.0))
 
-# %%
-import torch
-print(torch.cuda.is_available())       # True if CUDA GPU is available
-print(torch.cuda.get_device_name(0))   # GPU name
 
 # %%
-from tabpfn import TabPFNClassifier
-import os
-from dotenv import load_dotenv
 
-# Get the directory of the current script
-script_dir = os.path.dirname(os.path.abspath(__name__))
-env_path = os.path.join(script_dir, '.env')
-
-# Load the specific path
-load_dotenv(dotenv_path=env_path)
-load_dotenv()
-
-# %%
 
 import optuna
 # 1. Define bounds for tmp_thresh based on your original thresh_span
@@ -278,7 +272,7 @@ def logit_objective(trial):
 # Prune search early if threshold selects zero pathways
     if len(out_path) == 0:
         return 0.0  # Return baseline low score
-    tmp_drug_out_path_excess_count_df = gene_set_collection_excess_count_df.loc[:, out_path]
+    tmp_drug_out_path_excess_count_df = tmp_drug_excess_mutation_count_mat.loc[:, out_path]
     out_path_leading_edge_score_tbl = leading_edge_score_tbl.loc[:, out_path]
     out_path_leading_edge_member_list = (
         tmp_res.query('Pathway_Name in @out_path')
@@ -344,20 +338,8 @@ print(f"Associated PR-AUC: {study.best_trial.user_attrs['oof_pr_auc']:.4f}")
 print(f"Associated ROC-AUC: {study.best_trial.user_attrs['oof_roc_auc']:.4f}")
 
 # %%
-import plotly.io as pio
-pio.renderers.default = "browser"
-fig = optuna.visualization.plot_contour(study)
-fig.show()
 
-# %%
 
-perf_df = pd.DataFrame([f.user_attrs for f in study.trials]).assign(thresh = [f.params['tmp_thresh'] for f in study.trials], auprg = [f.values[0] for f in study.trials])
-
-tmp_ax = perf_df.sort_values('thresh').plot('thresh','auprg')
-plt.show()
-
-# %%
-# Recover best model
 
 
 # 1. Custom class to wrap the K fold models into a unified ensemble
@@ -385,7 +367,7 @@ best_C = best_params["C"]
 
 # 3. Reconstruct feature matrix and target using best_tmp_thresh
 out_path = tmp_res.query('x <= @best_tmp_thresh').Pathway_Name.to_list()
-tmp_drug_out_path_excess_count_df = gene_set_collection_excess_count_df.loc[:, out_path]
+tmp_drug_out_path_excess_count_df = tmp_drug_excess_mutation_count_mat.loc[:, out_path]
 out_path_leading_edge_score_tbl = leading_edge_score_tbl.loc[:, out_path]
 out_path_leading_edge_member_list = (
     tmp_res.query('Pathway_Name in @out_path')
@@ -437,7 +419,7 @@ coef_df = pd.DataFrame(
 )
 
 best_ensemble = OutOfFoldEnsemble(best_fold_models,best_params,coef_df)
-joblib.dump(best_ensemble, f"./data/tmp_res/logit_ensemble_drug_{drug_id}.joblib", compress=3)  # compress level 0-9
+#joblib.dump(best_ensemble, f"./data/tmp_res/logit_ensemble_drug_{drug_id}.joblib", compress=3)  # compress level 0-9
 # %%
 # Usage example on new unseen samples / holdout data:
 new_predictions = best_ensemble.predict_proba(F_augmented_df)[:, 1]
@@ -471,7 +453,8 @@ summary_coefs = pd.DataFrame({
     'selection_freq': (coef_df != 0).mean(axis=0)
 }).sort_values(by='selection_freq', ascending=False)
 
-summary_coefs.query('selection_freq >0').sort_values('mean_coef',ascending=True).loc[:,['min_coef','max_coef','mean_coef']]
+summary_coefs.query('selection_freq >0.5').sort_values('mean_coef',ascending=True).loc[:,['min_coef','max_coef','mean_coef']].tail(40)
+
 
 # %%
 
@@ -480,10 +463,20 @@ plt.show()
 
 # %%
 
+from tabpfn import TabPFNClassifier
+import os
+from dotenv import load_dotenv
 
+# Get the directory of the current script
+script_dir = os.path.dirname(os.path.abspath(__name__))
+env_path = os.path.join(script_dir, '.env')
 
+# Load the specific path
+load_dotenv(dotenv_path=env_path)
+load_dotenv()
 
 # %%
+
 def tabpfn_objective(trial):
     # --- HYPERPARAMETER SAMPLING ---
     # Sample tmp_thresh continuously between the bounds of thresh_span
@@ -493,7 +486,7 @@ def tabpfn_objective(trial):
 # Prune search early if threshold selects zero pathways
     if len(out_path) == 0:
         return 0.0  # Return baseline low score
-    tmp_drug_out_path_excess_count_df = gene_set_collection_excess_count_df.loc[:, out_path]
+    tmp_drug_out_path_excess_count_df = tmp_drug_excess_mutation_count_mat.loc[:, out_path]
     out_path_leading_edge_score_tbl = leading_edge_score_tbl.loc[:, out_path]
     out_path_leading_edge_member_list = (
         tmp_res.query('Pathway_Name in @out_path')
@@ -522,7 +515,7 @@ def tabpfn_objective(trial):
     for fold, (train_idx, val_idx) in enumerate(skf.split(F_augmented_df, y_union)):
         X_train, X_val = F_augmented_df.iloc[train_idx], F_augmented_df.iloc[val_idx]
         y_train, y_val = y_union.iloc[train_idx], y_union.iloc[val_idx]
-        model = TabPFNClassifier()
+        model = TabPFNClassifier(ignore_pretraining_limits=True)
         model.fit(X_train, y_train)
         oof_probs[val_idx] = model.predict_proba(X_val)[:,1]
 # --- OOF EVALUATION METRICS ---
@@ -553,19 +546,11 @@ print(f"Associated PR-AUC: {study.best_trial.user_attrs['oof_pr_auc']:.4f}")
 print(f"Associated ROC-AUC: {study.best_trial.user_attrs['oof_roc_auc']:.4f}")
 
 # %%
-import plotly.io as pio
-pio.renderers.default = "browser"
-fig = optuna.visualization.plot_contour(study)
-fig.show()
 
-# %%
 
-perf_df = pd.DataFrame([f.user_attrs for f in study.trials]).assign(thresh = [f.params['tmp_thresh'] for f in study.trials], auprg = [f.values[0] for f in study.trials])
+out_path = tmp_res.query('x <= @study.best_params["tmp_thresh"]').Pathway_Name.to_list()
 
-tmp_ax = perf_df.sort_values('thresh').plot('thresh','auprg')
-plt.show()
 
-# %%
 # 2. Extract best parameters from your Optuna study
 best_params = study.best_params
 best_tmp_thresh = best_params["tmp_thresh"]
@@ -634,18 +619,3 @@ sv = explainer.explain(F_augmented_df.iloc[2:3].values, budget=64)
 print(sv)              # top interactions ranked by magnitude
 sv.plot_waterfall()    # waterfall plot showing additive co
 
-# %%
-
-# %%
-# Regression potential
-
-tmp_ax =( dose_data_tbl
-         .query('DRUG_ID == @drug_id')
-         .merge(LE_count_tbl.rename(columns={'Leading_Edge_Cell_Lines':'SANGER_MODEL_ID'}))
-         .assign(LE = lambda df: pd.qcut(df.path_count,[0.01,0.1,0.25,0.5,0.75,0.95,1]))
-         .groupby('LE').AUC.plot.kde(legend=True)
-         )
-plt.show()
-# %%
-tmp_ax= dose_data_tbl.query('DRUG_ID == @drug_id').merge(LE_count_tbl.rename(columns={'Leading_Edge_Cell_Lines':'SANGER_MODEL_ID'}),how='left').fillna(0).assign(AUC_rank = lambda df: df.AUC.rank(pct=True,ascending=True)).plot.scatter(x='AUC_rank',y='path_count')
-plt.show()
