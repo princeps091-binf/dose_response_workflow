@@ -204,8 +204,6 @@ best_ensemble = joblib.load(best_ensemble_path)
 # %%
 leading_edge_member_list = tmp_res.loc[:,['Pathway_Name','Leading_Edge_Cell_Lines']].set_index('Pathway_Name').loc[gene_set_collection_excess_count_df.columns,'Leading_Edge_Cell_Lines'].to_list()
 
-
-
 leading_edge_score_tbl = compute_leading_edge_quantiles_vectorized(gene_set_collection_excess_count_df,leading_edge_member_list)
 
 # %%
@@ -267,6 +265,11 @@ tmp_ax = optim_pred_df.plot.scatter(x='proba',y='LE',alpha=0.1)
 plt.show()
 
 # %%
+tmp_res.loc[:,['Pathway_Name','x']].merge(
+best_ensemble.coef_df.T.iloc[:,4].reset_index().rename(columns={'index':'Pathway_Name',4:'coef'}),how='left'
+).fillna(0).plot.scatter(x='x',y='coef')
+plt.show()
+# %%
 credible_LE_cells_list = optim_pred_df.query('proba > 0.5 and LE ==1').sanger_model_id.unique()
 
 
@@ -277,6 +280,7 @@ summary_coefs = pd.DataFrame({
     'selection_freq': (best_ensemble.coef_df != 0).mean(axis=0)
 }).sort_values(by='selection_freq', ascending=False)
 model_path_to_keep_list = summary_coefs.query('selection_freq > 0.5').index.tolist()
+
 # %%
 gene_in_optim_model_list = list(set().union(*(gene_set_to_use_dict[k] for k in model_path_to_keep_list if k in gene_set_to_use_dict)))
 
@@ -285,13 +289,218 @@ model_gene_set_dict = {k: gene_set_to_use_dict[k] for k in model_path_to_keep_li
 out_path = model_gene_set_dict.keys()
 # %%
 
-
 tmp_ax = dose_data_tbl.query('DRUG_ID == @drug_id').assign(leading_edge = lambda df: df.SANGER_MODEL_ID.isin(credible_LE_cells_list)).groupby('leading_edge').AUC.plot.kde(legend=True)
 
 plt.show()
 
 # %%
+Pathway_to_gene_coef_df = (pd.DataFrame(model_gene_set_dict.items(),columns=['Pathway_Name','gene']).explode('gene')
+.merge(best_ensemble.coef_df.T.iloc[:,3].reset_index().rename(columns={'index':'Pathway_Name',3:'coef'}))
+ )
+Pathway_size_df = Pathway_to_gene_coef_df.Pathway_Name.value_counts().reset_index().rename(columns={'count':'pathway_size'})
+Pathway_to_gene_coef_df = Pathway_to_gene_coef_df.merge(Pathway_size_df)
 
+Pathway_to_cell_score_df = out_path_leading_edge_score_tbl.stack().reset_index().rename(columns={'level_1':'Pathway_Name',0:'score'})
+
+# %%
+
+merged_df = (tmp_drug_excess_mutation_count_tbl
+ .query('gene in @gene_in_optim_model_list')
+ .merge(Pathway_to_gene_coef_df,how='left')
+ .merge(Pathway_to_cell_score_df,how='left')
+             )
+
+pathway_gene_sums = (
+    merged_df
+    .groupby(['sanger_model_id', 'Pathway_Name'])
+    .agg(pathway_mutation_sum = ('excess_mutation_count','sum'))
+    .reset_index()
+)
+merged_df = merged_df.merge(pathway_gene_sums)
+gene_to_cell_contrib_df = (
+merged_df.assign(contrib_score = lambda df: (df.coef/df.pathway_size) * df.score * (df.excess_mutation_count/df.pathway_mutation_sum))
+ .groupby(['sanger_model_id','gene'])
+ .agg(contrib_score = ('contrib_score','sum'),
+      max_contrib = ('contrib_score','max'))
+ .reset_index()
+ .assign(LE = lambda df: df.sanger_model_id.isin(credible_LE_cells_list))
+ )
+
+gene_to_cell_contrib_df = gene_to_cell_contrib_df.merge(pd.DataFrame({'sanger_model_id':F_augmented_df.index.tolist(),'proba':new_predictions}))
+
+# %%
+# Recovery of odds vs proba positive relation
+(
+        gene_to_cell_contrib_df
+        .groupby(['sanger_model_id','proba','LE'])
+        .agg(contrib_score=('contrib_score','sum'))
+        .assign(score = lambda df: np.exp((df.contrib_score)))
+        .reset_index()
+        .assign(cLE = lambda df: np.where(df.LE,'red','grey'))
+        .plot.scatter(x='proba',y='score',c='cLE')
+        )
+plt.show()
+
+# %%
+
+from scipy.stats import mannwhitneyu
+from statsmodels.stats.multitest import multipletests
+
+def compute_tp_nudge_dominance_long(df_long, df_meta,score, threshold=0.5):
+    """
+    Computes the Proportion of Stochastic Dominance (PDS / ROC-AUC equivalent)
+    directly on a 3-column tidy DataFrame (cell, gene, contrib_score).
+    """
+    # 1. Identify True Positive cell IDs vs. Rest
+    meta = df_meta.copy()
+    meta['is_tp'] = (meta['LE'] == 1) & (meta['proba'] >= threshold)
+    tp_cells = set(meta.loc[meta['is_tp'], 'sanger_model_id'])
+    all_cells = set(meta['sanger_model_id'])
+    rest_cells = all_cells - tp_cells
+    
+    n_tp_total = len(tp_cells)
+    n_rest_total = len(rest_cells)
+    
+    if n_tp_total == 0:
+        raise ValueError("No True Positive cell lines found at threshold!")
+    # 2. Add sample-type flag (TP vs Rest) to the long attribution table
+    df = df_long.copy()
+    df['is_tp'] = df['sanger_model_id'].isin(tp_cells)
+    
+    # 3. Compute metric gene-by-gene
+    results = []
+    
+    # Group by gene to process each gene vector independently
+    for gene, group in df.groupby('gene'):
+        # Extract explicit scores present in the sparse table
+        tp_scores_present = group.loc[group['is_tp'], score].values
+        rest_scores_present = group.loc[~group['is_tp'], score].values
+        
+        # Account for implicit zero-scores (wild-type cells missing from sparse table)
+        n_tp_zeros = n_tp_total - len(tp_scores_present)
+        n_rest_zeros = n_rest_total - len(rest_scores_present)
+        
+        # Construct full vectors including zero-attributed wild-type cells
+        scores_tp = np.concatenate([tp_scores_present, np.zeros(n_tp_zeros)])
+        scores_rest = np.concatenate([rest_scores_present, np.zeros(n_rest_zeros)])
+        
+        # Mann-Whitney U test (checks if TP scores > Rest scores)
+        u_stat, p_val = mannwhitneyu(scores_tp, scores_rest, alternative='greater')
+        
+        # Compute Stochastic Dominance (AUC / PDS)
+        pds = u_stat / (n_tp_total * n_rest_total)
+        
+        results.append({
+            'gene': gene,
+            'pds_score': pds,
+            'p_value': p_val,
+            'tp_mutated_n': len(tp_scores_present),
+            'median_phi_TP': np.median(scores_tp),
+            'median_phi_Rest': np.median(scores_rest)
+        })
+        
+    res_df = pd.DataFrame(results)
+    res_df['q_value'] = multipletests(res_df['p_value'], method='fdr_bh')[1]
+    
+    return res_df.sort_values(by='pds_score', ascending=False).reset_index(drop=True)
+
+# %%
+
+new_pred_tbl = pd.DataFrame({'sanger_model_id':F_augmented_df.index.tolist(),'proba':new_predictions}).merge(y_union.reset_index().rename(columns={0:'LE'}))
+
+
+gene_weight_tbl = compute_tp_nudge_dominance_long(gene_to_cell_contrib_df, new_pred_tbl,'max_contrib', threshold=0.5)
+
+gene_weight_tbl.query('pds_score > 0.5 and q_value < 0.5').sort_values('q_value',ascending=True).head(60)
+
+# %%
+
+# %%
+tmp_ax = (
+tmp_drug_excess_mutation_count_tbl
+.query('gene == "CACNA2D1"')
+.assign(LE = lambda df: df.sanger_model_id.isin(credible_LE_cells_list))
+
+ .groupby('LE')
+ .excess_mutation_count.plot.kde(legend=True)
+ )
+plt.show()
+
+# %%
+
+path_to_cell_contrib_df = (
+        F_augmented_df.loc[:,model_path_to_keep_list]
+        .stack()
+        .reset_index()
+        .rename(columns={'level_1':'Pathway_Name',0:'qscore'})
+        .merge(best_ensemble.coef_df.iloc[0,:]
+               .reset_index()
+               .rename(columns={'index':'Pathway_Name',0:'coef'}),how='left')
+        .assign(path_contrib = lambda df: df.qscore * df.coef,
+                LE = lambda df: df.sanger_model_id.isin(credible_LE_cells_list))
+
+)
+
+tp_mask_series = path_to_cell_contrib_df.groupby('sanger_model_id')['LE'].first()
+
+phi_matrix = path_to_cell_contrib_df.pivot(
+        index='sanger_model_id', 
+        columns='Pathway_Name', 
+        values='path_contrib'
+    ).fillna(0.0)
+
+tp_samples = tp_mask_series[tp_mask_series].index.tolist()
+rest_samples = tp_mask_series[~tp_mask_series].index.tolist()
+
+phi_tp = phi_matrix.loc[tp_samples]# Shape: (N_tp, K_pathways)
+phi_rest = phi_matrix.loc[rest_samples].values # Shape: (N_rest, K_pathways)
+
+# 4. Vectorized PDS calculation via broadcasting:
+# Compare each rest sample attribution against each TP sample attribution
+# (N_rest, 1, K_pathways) < (1, N_tp, K_pathways) -> mean over axis 0 (rest samples)
+pds_values = (phi_rest[:, None, :] < phi_tp.values[None, :, :]).mean(axis=0)
+
+pds_tp_df = pd.DataFrame(
+        pds_values,
+        index=tp_samples,
+        columns=phi_tp.columns
+    )
+
+# 5. Melt back to tidy long format for downstream gene projection
+df_pds_long = pds_tp_df.reset_index().melt(
+    id_vars='index',
+    var_name='Pathway_Name',
+    value_name='pds_pathway'
+).rename(columns={'index': 'sanger_model_id'})
+
+# %%
+df_pds_long.merge(
+path_to_cell_contrib_df.loc[:,['sanger_model_id','Pathway_Name','coef','path_contrib']]
+).plot.scatter(x='coef',y='pds_pathway')
+# %%
+(
+df_pds_long
+    # 1. Compute per-cell percentile rank across pathways
+    .assign(
+        pds_percentile_rank=lambda df: (
+            df.groupby('sanger_model_id')['pds_pathway']
+              .rank(pct=True, method='average')
+        ),
+        # 2. Calculate Rank-Weighted Pathway Importance
+        weighted_pds=lambda df: df['pds_pathway'] * df['pds_percentile_rank']
+    )
+    ).plot.scatter(x='pds_pathway',y='weighted_pds')
+plt.show()
+    # %%
+Pathway_to_gene_coef_df = (pd.DataFrame(model_gene_set_dict.items(),columns=['Pathway_Name','gene']).explode('gene')
+.merge(best_ensemble.coef_df.T.iloc[:,0].reset_index().rename(columns={'index':'Pathway_Name',0:'coef'}))
+ )
+Pathway_size_df = Pathway_to_gene_coef_df.Pathway_Name.value_counts().reset_index().rename(columns={'count':'pathway_size'})
+Pathway_to_gene_coef_df = Pathway_to_gene_coef_df.merge(Pathway_size_df)
+
+
+
+# %%
 agg_edge_df_list = []
 agg_node_df_list = []
 

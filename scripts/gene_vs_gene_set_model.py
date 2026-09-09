@@ -548,16 +548,13 @@ print(f"Associated ROC-AUC: {study.best_trial.user_attrs['oof_roc_auc']:.4f}")
 # %%
 
 
-out_path = tmp_res.query('x <= @study.best_params["tmp_thresh"]').Pathway_Name.to_list()
-
-
 # 2. Extract best parameters from your Optuna study
 best_params = study.best_params
 best_tmp_thresh = best_params["tmp_thresh"]
 
 # 3. Reconstruct feature matrix and target using best_tmp_thresh
 out_path = tmp_res.query('x <= @best_tmp_thresh').Pathway_Name.to_list()
-tmp_drug_out_path_excess_count_df = gene_set_collection_excess_count_df.loc[:, out_path]
+tmp_drug_out_path_excess_count_df = tmp_drug_excess_mutation_count_mat.loc[:, out_path]
 out_path_leading_edge_score_tbl = leading_edge_score_tbl.loc[:, out_path]
 out_path_leading_edge_member_list = (
     tmp_res.query('Pathway_Name in @out_path')
@@ -579,6 +576,7 @@ LE_cells = LE_count_tbl.query('path_count > 0').Leading_Edge_Cell_Lines.to_list(
 y_union = pd.Series(cell_ids.isin(LE_cells).astype(int), index=cell_ids)
 
 F_augmented_df = augment_features_for_or_logic(out_path_leading_edge_score_tbl, tmp_res)
+# %%
 # 4. Fit and collect the K fold models
 n_splits = 5
 skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
@@ -587,16 +585,16 @@ best_fold_models = []
 for fold, (train_idx, val_idx) in enumerate(skf.split(F_augmented_df, y_union)):
     X_train, X_val = F_augmented_df.iloc[train_idx], F_augmented_df.iloc[val_idx]
     y_train, y_val = y_union.iloc[train_idx], y_union.iloc[val_idx]
-    model = TabPFNClassifier(fit_mode = 'fit_with_cache')
+    model = TabPFNClassifier(fit_mode = 'fit_with_cache',ignore_pretraining_limits=True)
     model.fit(X_train, y_train)
     best_fold_models.append(model)
 
 # 5. Instantiate the ensemble
-best_ensemble = OutOfFoldEnsemble(best_fold_models)
+best_ensemble = OutOfFoldEnsemble(best_fold_models,study.best_params,pd.DataFrame({}))
 
 # %%
 # Usage example on new unseen samples / holdout data:
-new_predictions = best_ensemble.predict_proba(F_augmented_df)[:, 1]
+new_predictions = best_ensemble.predict_proba(F_augmented_df)[:,1]
 
 optim_pred_df = pd.DataFrame({'proba':new_predictions,'sanger_model_id':F_augmented_df.index.tolist()}).merge(y_union.reset_index()).rename(columns={0:'LE'})
 
@@ -619,3 +617,8 @@ sv = explainer.explain(F_augmented_df.iloc[2:3].values, budget=64)
 print(sv)              # top interactions ranked by magnitude
 sv.plot_waterfall()    # waterfall plot showing additive co
 
+# %%
+
+from tabpfn_extensions.interpretability.feature_selection import feature_selection
+
+result = feature_selection(model, F_augmented_df.values, y_union.values, n_features_to_select=100)

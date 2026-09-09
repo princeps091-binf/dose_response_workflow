@@ -311,6 +311,7 @@ def logit_objective(trial):
             l1_ratio=1,  # Equal mix of L1 (Lasso) and L2 (Ridge)
             C=C,         # Inverse regularization strength
             solver="liblinear",
+            positive = True,
             max_iter=10000,
             random_state=42 + fold  # Vary random state per fold
         )
@@ -334,7 +335,7 @@ study = optuna.create_study(
     sampler=optuna.samplers.TPESampler(seed=42)
 )
 
-study.optimize(logit_objective, n_trials=50, timeout=1800)  # Adjust trials/timeout as needed
+study.optimize(logit_objective, n_trials=150, timeout=1800)  # Adjust trials/timeout as needed
 
 # %%
 
