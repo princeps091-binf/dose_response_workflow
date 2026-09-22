@@ -97,6 +97,7 @@ plt.show()
 # %%
 drug_id = 1372
 null_cell_lines_list = null_dose_data_tbl.query('DRUG_ID == @drug_id').SANGER_MODEL_ID.unique().tolist()
+
 tmp_gene = 'RYR2'
 gene_mutation_count_df = base_matrix.loc[:,[tmp_gene]].reset_index().rename(columns={tmp_gene:'gene_mut_count'}).query('sanger_model_id in @null_cell_lines_list').merge(
 dose_data_tbl.loc[:,['SANGER_MODEL_ID','CANCER_TYPE']].rename(columns={'SANGER_MODEL_ID':'sanger_model_id'}).drop_duplicates(),on='sanger_model_id').merge(total_exome_loads.reset_index())
@@ -114,7 +115,7 @@ import bambi as bmb
 # '(1 | tissue_type)' adds a random intercept for tissue of origin
 formula = "gene_mut_count ~ 1 + offset(log_total_muts) + (1 | CANCER_TYPE)"
 
-# 3. Fit the Negative Binomial model to handle overdispersion
+#tmp_drug_excess_mutation_count_tbl.iloc[train_idx] 3. Fit the Negative Binomial model to handle overdispersion
 model = bmb.Model(
     formula=formula,
     data=gene_mutation_count_df,
@@ -140,7 +141,7 @@ plt.show()
 # %%
 
 az.plot_posterior(results)
-
+plt.show()
 # %%
 idata = model.predict(results,kind='response',inplace=False)
 
@@ -159,3 +160,7 @@ preds = model.predict(
     inplace=False
 )
 
+# %%
+preds.posterior_predictive['gene_mut_count'][0,:,0]
+
+preds.observed_data['gene_mut_count']

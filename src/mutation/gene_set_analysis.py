@@ -418,13 +418,11 @@ def run_high_throughput_parallel_xlmhg(
     # CRITICAL FOR MULTI-PROCESSING: Ensure memory layout is continuous and C-aligned
     # This allows the operating system to share it perfectly via copy-on-write pointers
     K_matrix = np.ascontiguousarray(aligned_burden.values, dtype=np.float64)  # Shape: (n_cells, n_pathways)
-    
     N = len(sorted_cells)
     pathway_names = aligned_burden.columns.tolist()
-    
     X_param = 1
     L_param = int(N * 0.50)
-    
+    print(len(sorted_cells))
     print(f"Step 2: Spawning zero-copy worker pool across {n_jobs} cores...")
     # Parallel map operation over columns. 
     # K_matrix[:, p_idx] generates a zero-copy memory view (slice), NOT a data duplicate.
@@ -439,11 +437,10 @@ def run_high_throughput_parallel_xlmhg(
             N=N
         ) for p_idx in range(len(pathway_names))
     )
-    
     # Clean up and filter out empty skipped pathways
     results_records = [r for r in raw_results if r is not None]
     
-    summary_df = pd.DataFrame(results_records).sort_values(by='Neg_Log_mHG_P', ascending=False).reset_index(drop=True)
+    summary_df = pd.DataFrame(results_records).reset_index(drop=True)
     print(f"Success. Parallel engine evaluated {len(summary_df)} active gene sets with zero data duplication.")
     return summary_df
 

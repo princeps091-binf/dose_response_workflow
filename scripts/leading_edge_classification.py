@@ -274,6 +274,7 @@ def logit_objective(trial):
     # Optionally tune C (inverse regularization strength) alongside ElasticNet
     C = trial.suggest_float("C", 1e-3, 10.0, log=True)
 # --- FEATURE SELECTION & TARGET CONSTRUCTION ---
+# --- Need to produce the minimum hypergeometric score within the fold
     out_path = tmp_res.query('x <= @tmp_thresh').Pathway_Name.to_list()
 # Prune search early if threshold selects zero pathways
     if len(out_path) == 0:
@@ -308,10 +309,10 @@ def logit_objective(trial):
         X_train, X_val = F_augmented_df.iloc[train_idx], F_augmented_df.iloc[val_idx]
         y_train, y_val = y_union.iloc[train_idx], y_union.iloc[val_idx]
         clf = LogisticRegression(
-            l1_ratio=1,  # Equal mix of L1 (Lasso) and L2 (Ridge)
+            l1_ratio=1.0,  # Equal mix of L1 (Lasso) and L2 (Ridge)
             C=C,         # Inverse regularization strength
             solver="liblinear",
-            positive = True,
+            # tol=1e-3,
             max_iter=10000,
             random_state=42 + fold  # Vary random state per fold
         )
@@ -383,6 +384,7 @@ class OutOfFoldEnsemble:
 best_params = study.best_params
 best_tmp_thresh = best_params["tmp_thresh"]
 best_C = best_params["C"]
+# best_l1_ratio = best_params["l1_ratio"]
 
 # 3. Reconstruct feature matrix and target using best_tmp_thresh
 out_path = tmp_res.query('x <= @best_tmp_thresh').Pathway_Name.to_list()
@@ -419,9 +421,10 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(F_augmented_df, y_union)):
     X_train, y_train = F_augmented_df.iloc[train_idx], y_union.iloc[train_idx]
     # Initialize model using best hyperparameter values
     clf = LogisticRegression(
-            l1_ratio=1,  # Equal mix of L1 (Lasso) and L2 (Ridge)
+            l1_ratio= 1.0,  # Equal mix of L1 (Lasso) and L2 (Ridge)
             C=best_C,         # Inverse regularization strength
             solver="liblinear",
+            # tol=1e-3,
             max_iter=10000,
             random_state=42 + fold  # Vary random state per fold
     )
@@ -438,7 +441,7 @@ coef_df = pd.DataFrame(
 )
 
 best_ensemble = OutOfFoldEnsemble(best_fold_models,best_params,coef_df)
-joblib.dump(best_ensemble, f"./data/tmp_res/logit_ensemble_drug_{drug_id}.joblib", compress=3)  # compress level 0-9
+# joblib.dump(best_ensemble, f"./data/tmp_res/logit_elasticnet_ensemble_drug_{drug_id}.joblib", compress=3)  # compress level 0-9
 # %%
 # Usage example on new unseen samples / holdout data:
 new_predictions = best_ensemble.predict_proba(F_augmented_df)[:, 1]
