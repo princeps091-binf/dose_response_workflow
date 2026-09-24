@@ -73,7 +73,7 @@ N_vector = total_exome_loads.reindex(all_cells).fillna(0).values.reshape(-1, 1) 
 
 # %%
 
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, KFold
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import precision_recall_curve, auc, roc_auc_score
 
@@ -172,143 +172,13 @@ def augment_features_for_or_logic(F_df: pd.DataFrame, pathway_rank_df: pd.DataFr
     F_augmented['F_count'] = (F_df > 0).sum(axis=1)
     return F_augmented
 
-# %%
-
-
-def compute_auprg(y_true, y_scores):
-    """Calcule l'Aire Sous la Courbe Precision-Recall Gain (AUPRG) selon Flach & Kull (2015).
-    y_true   : array-like, étiquettes réelles (0 ou 1)
-    y_scores : array-like, probabilités ou scores prédits par le modèle
-    """
-    y_true = np.asarray(y_true)
-    y_scores = np.asarray(y_scores)
-    # 1. Calcul de la prévalence (pi)
-    pi = np.mean(y_true)
-    if pi == 0 or pi == 1:
-        return 0.0  # Cas triviaux
-    # 2. Obtenir la courbe PR standard de Scikit-Learn
-    precision, recall, _ = precision_recall_curve(y_true, y_scores)
-    # Inverser pour avoir recall croissant (de 0 à 1)
-    precision = precision[::-1]
-    recall = recall[::-1]
-    # 3. Formules PR-Gain
-    with np.errstate(divide="ignore", invalid="ignore"):
-        rg = (recall - pi) / ((1 - pi) * recall)
-        pg = (precision - pi) / ((1 - pi) * precision)
-    # 4. Conserver uniquement les points où Recall Gain > 0 et Precision Gain > 0
-    # (Ou effectuer l'interpolation linéaire vers l'origine (0,0))
-    valid_mask = (recall > pi) & (precision > pi)
-    rg_valid = rg[valid_mask]
-    pg_valid = pg[valid_mask]
-    if len(rg_valid) == 0:
-        return 0.0  # Aucun gain par rapport au hasard
-    # 5. Ancrer explicitement la courbe à l'origine (0, 0)
-    rg_final = np.concatenate(([0.0], rg_valid))
-    pg_final = np.concatenate(([0.0], pg_valid))
-    # 6. S'assurer que les points sont strictement croissants sur Recall Gain
-    sort_idx = np.argsort(rg_final)
-    rg_sorted = rg_final[sort_idx]
-    pg_sorted = pg_final[sort_idx]
-    # 7. Intégration numérique par la méthode des trapèzes
-    # Utiliser np.trapezoid (NumPy 2.0+) ou np.trapz (versions antérieures)
-    auprg = np.trapezoid(pg_sorted, rg_sorted)
-    return float(np.clip(auprg, 0.0, 1.0))
-
-# %%
-
-def compute_fold_mhg_and_features(
-    raw_excess_df, 
-    drug_sensitivity_df, 
-    tmp_thresh, 
-    train_idx, 
-    val_idx
-):
-    """
-    Computes xlmhgt, mHG pathway pruning, target construction (y_union), 
-    and leading-edge percentile feature ranks STRICTLY on the training fold.
-    """
-    # ensure correspondence of cell line ordering between the dose response and the excess mutation tables
-    # -> convert the idx into actual cell line IDs?
-    # 1. Split Raw Inputs into Train and Validation
-    raw_train = raw_excess_df.iloc[train_idx]
-    y_sens_train = drug_sensitivity_df.sensitivity_p.iloc[train_idx]
-    
-    raw_val = raw_excess_df.iloc[val_idx]
-    
-    # 2. Run xlmhgt STRICTLY on Training Fold
-    # Sort training samples by drug sensitivity (descending)
-    train_rank_order = y_sens_train.sort_values(ascending=False).index
-    
-    
-    fold_res_df = src.mutation.gene_set_analysis.run_high_throughput_parallel_xlmhg(
-        pathway_burden_df = raw_train,   
-        drug_sensitivity_df = y_sens_train, 
-        n_burden_steps = 20,
-        auc_col = 'sensitivity_p',
-        sanger_id_col = 'SANGER_MODEL_ID',
-        n_jobs = 8  
-    )
-
-    tmp_res = tmp_res.assign(x = lambda df: df.Min_mHG_P_Value.rank(pct=True),y=lambda df:-np.log10(df.Min_mHG_P_Value)).sort_values('x')
-
-    # 3. Filter Pathways based on Trial Threshold (tmp_thresh)
-    out_path = fold_res_df.query('x <= @tmp_thresh').Pathway_Name.tolist()
-    if len(out_path) == 0:
-        return None, None, None, None
-        
-    # 4. Construct Target (y_union) for Training and Validation Folds
-    train_le_cells = (
-        fold_res_df.query('Pathway_Name in @out_path')
-        .Leading_Edge_Cell_Lines.explode()
-        .unique()
-    )
-    
-    y_train = pd.Series(raw_train.index.isin(train_le_cells).astype(int), index=raw_train.index)
-    y_val = pd.Series(raw_val.index.isin(train_le_cells).astype(int), index=raw_val.index)
-    
-    # Check for single-class target in training fold
-    if y_train.nunique() < 2:
-        return None, None, None, None
-
-    # 5. Build Leading-Edge Percentile Rank Features (eCDF Fit on Train LE Only)
-    X_train_list, X_val_list = [], []
-    
-    for p in out_path:
-        p_le_cells = fold_res_df.query('Pathway_Name == @p').Leading_Edge_Cell_Lines.values[0]
-        
-        # Fit eCDF strictly on training fold's leading-edge excess scores
-        train_le_scores = raw_train.loc[raw_train.index.isin(p_le_cells), p].values
-        if len(train_le_scores) == 0:
-            train_le_scores = raw_train[p].values  # Fallback if empty
-            
-        sorted_le_scores = np.sort(train_le_scores)
-        
-        # Transform Train features
-        train_p_scores = raw_train[p].values
-        train_perc = np.searchsorted(sorted_le_scores, train_p_scores, side="right") / len(sorted_le_scores)
-        X_train_list.append(pd.Series(train_perc, index=raw_train.index, name=p))
-        
-        # Transform Validation features using Training-learned eCDF
-        val_p_scores = raw_val[p].values
-        val_perc = np.searchsorted(sorted_le_scores, val_p_scores, side="right") / len(sorted_le_scores)
-        X_val_list.append(pd.Series(val_perc, index=raw_val.index, name=p))
-        
-    X_train = pd.concat(X_train_list, axis=1)
-    X_val = pd.concat(X_val_list, axis=1)
-    
-    # Optional feature augmentation step (if required by logic)
-    X_train = augment_features_for_or_logic(X_train, fold_res_df)
-    X_val = augment_features_for_or_logic(X_val, fold_res_df)
-    
-    return X_train, y_train, X_val, y_val
 
 
 # %%
 import optuna
 # 1. Define bounds for tmp_thresh based on your original thresh_span
-thresh_min = float(tmp_res.x.min())
+thresh_min = 1/len(gene_set_to_use_dict)
 thresh_max = float(0.5)
-
 def logit_objective(trial):
     # --- HYPERPARAMETER SAMPLING ---
     # Sample tmp_thresh continuously between the bounds of thresh_span
@@ -316,20 +186,15 @@ def logit_objective(trial):
     # Sample l1_ratio between 0 (Pure L2) and 1 (Pure L1 / Lasso)
     # Optionally tune C (inverse regularization strength) alongside ElasticNet
     C = trial.suggest_float("C", 1e-3, 10.0, log=True)
-
-# Outer Cross-Validation on RAW Un-transformed Data
+    # Outer Cross-Validation on RAW Un-transformed Data
     n_splits = 5
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-    oof_probs = np.zeros(len(gene_set_collection_excess_count_df))
-    oof_targets = np.zeros(len(gene_set_collection_excess_count_df))
-    valid_fold_indices = []
-
-    for fold, (train_idx, val_idx) in enumerate(skf.split(gene_set_collection_excess_count_df, tmp_drug_data_tbl)):
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    oof_probs = np.zeros(len(tmp_drug_excess_mutation_count_tbl))
+    for fold, (train_idx, val_idx) in enumerate(kf.split(tmp_drug_excess_mutation_count_tbl, tmp_drug_sensitivity_series)):
         X_train_df = tmp_drug_excess_mutation_count_tbl.iloc[train_idx]
         Y_train_df = tmp_drug_sensitivity_series.iloc[train_idx]
-        X_val = tmp_drug_excess_mutation_count_tbl.iloc[val_idx]
-# --- FEATURE SELECTION & TARGET CONSTRUCTION ---
-# --- Need to produce the minimum hypergeometric score within the fold
+        # --- FEATURE SELECTION & TARGET CONSTRUCTION ---
+        # --- Need to produce the minimum hypergeometric score within the fold
         tmp_res = src.mutation.gene_set_analysis.run_high_throughput_parallel_xlmhg(
             pathway_burden_df = X_train_df,   
             drug_sensitivity_df = Y_train_df.reset_index(), 
@@ -337,58 +202,61 @@ def logit_objective(trial):
             auc_col = 'sensitivity_p',
             sanger_id_col = 'SANGER_MODEL_ID',
             n_jobs = 8  
-        )
-
+           )
         tmp_res = tmp_res.assign(x = lambda df: df.Min_mHG_P_Value.rank(pct=True),y=lambda df:-np.log10(df.Min_mHG_P_Value)).sort_values('x')
-
         out_path = tmp_res.query('x <= @tmp_thresh').Pathway_Name.to_list()
-        leading_edge_member_list = tmp_res.loc[:,['Pathway_Name','Leading_Edge_Cell_Lines']].set_index('Pathway_Name').loc[X_train_df.columns,'Leading_Edge_Cell_Lines'].to_list()
-        leading_edge_score_tbl = compute_leading_edge_quantiles_vectorized(X_train_df,leading_edge_member_list)
+        fold_leading_edge_member_list = tmp_res.loc[:,['Pathway_Name','Leading_Edge_Cell_Lines']].set_index('Pathway_Name').loc[X_train_df.columns,'Leading_Edge_Cell_Lines'].to_list()
+        fold_leading_edge_score_tbl = compute_leading_edge_quantiles_vectorized(tmp_drug_excess_mutation_count_tbl,fold_leading_edge_member_list)
         # Prune search early if threshold selects zero pathways
         if len(out_path) == 0:
             return 0.0  # Return baseline low score
-        out_path_leading_edge_score_tbl = leading_edge_score_tbl.loc[:, out_path]
-        out_path_leading_edge_member_list = (
-            tmp_res.query('Pathway_Name in @out_path')
-            .Leading_Edge_Cell_Lines.explode()
-            .unique()
-            .tolist()
-            )
         cell_ids = X_train_df.index
         LE_count_tbl = (
-            pd.DataFrame({'SANGER_MODEL_ID': out_path_leading_edge_member_list})
-            .explode('SANGER_MODEL_ID')
+            tmp_res.query('Pathway_Name in @out_path')
+            .Leading_Edge_Cell_Lines.explode()
             .value_counts()
             .reset_index()
             .rename(columns={'count': 'path_count'})
         )
-        LE_cells = LE_count_tbl.query('path_count > 0').SANGER_MODEL_ID.to_list()
+        LE_cells = LE_count_tbl.query('path_count > 0').Leading_Edge_Cell_Lines.to_list()
         y_union = pd.Series(cell_ids.isin(LE_cells).astype(int), index=cell_ids)
-    # Check for single-class targets in extreme threshold edge cases
+        # Check for single-class targets in extreme threshold edge cases
         if y_union.nunique() < 2:
             return 0.0
-        F_augmented_df = augment_features_for_or_logic(out_path_leading_edge_score_tbl, tmp_res)
+        F_augmented_df = augment_features_for_or_logic(fold_leading_edge_score_tbl.loc[y_union.index,out_path], tmp_res)
         clf = LogisticRegression(
                 l1_ratio=1.0,  # Equal mix of L1 (Lasso) and L2 (Ridge)
                 C=C,         # Inverse regularization strength
                 solver="liblinear",
                 # tol=1e-3,
                 max_iter=10000,
-                random_state=42 + fold  # Vary random state per fold
+                random_state=42 + fold # Vary random state per fold
             )
         clf.fit(F_augmented_df, y_union)
-
-        val_leading_edge_score_tbl = compute_leading_edge_quantiles_vectorized(X_val,leading_edge_member_list)
-        val_out_path_leading_edge_score_tbl = val_leading_edge_score_tbl.loc[:, out_path]
-
+        val_out_path_leading_edge_score_tbl = fold_leading_edge_score_tbl.loc[tmp_drug_excess_mutation_count_tbl.index[val_idx], out_path]
         val_F_augmented_df = augment_features_for_or_logic(val_out_path_leading_edge_score_tbl, tmp_res)
         oof_probs[val_idx] = clf.predict_proba(val_F_augmented_df)[:, 1]
     # --- OOF EVALUATION METRICS ---
-        # Compute AUPRG on continuous predicted probabilities (not binary oof_preds)
-        # Store auxiliary metrics as trial user attributes for later retrieval
-        # TODO: Spearman correleation between proba and AUC as optimisation criteria
-        val_criteria = 0
-        return val_criteria
+    eval_tbl = (pd.DataFrame({'SANGER_MODEL_ID':tmp_drug_excess_mutation_count_tbl.index,'oof_proba':oof_probs})
+                .merge(tmp_drug_sensitivity_series.reset_index())
+                .assign(not_resistant = lambda df: df.sensitivity_p.lt(0.5),
+                        sensitive_class = lambda df: df.oof_proba.gt(0.5))
+    )
+    N = eval_tbl.shape[0]
+    N_sens = eval_tbl.not_resistant.sum()
+    m = eval_tbl.sensitive_class.sum()
+    k = eval_tbl.query('not_resistant & sensitive_class').shape[0]
+    p_enrichment = hypergeom.sf(k - 1, N, N_sens, m)
+    # 5. Fold Enrichment Ratio = (Observed Precision) / (Background Prevalence)
+    observed_precision = k / m
+    background_prevalence = N_sens / N
+    fold_enrichment = observed_precision / background_prevalence if background_prevalence > 0 else 0.0
+    if fold_enrichment <= 1.0:
+        return 0.0   
+    if m == 0 or N_sens == 0:
+        return 0.0
+    return fold_enrichment * (1 - p_enrichment)
+
 
 # %%
 
