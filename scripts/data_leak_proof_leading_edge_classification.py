@@ -262,22 +262,32 @@ def logit_objective(trial):
     p_enrichment_res = hypergeom.sf(k_res - 1, N, N_res, m_res)
     fold_enrichment_res = (k_res / m_res) / (N_res / N)
     # --- COMBINED HARMONIC MULTIPLIER ---
-    score_sens = fold_enrichment_sens * (1 - p_enrichment_sens) if fold_enrichment_sens > 1.0 else 0.0
-    score_res = fold_enrichment_res * (1 - p_enrichment_res) if fold_enrichment_res > 1.0 else 0.0
+    if fold_enrichment_sens > 1.0:
+        score_sens = fold_enrichment_sens * (1 - p_enrichment_sens)
+    else:
+        # Give a small, proportional score so Optuna knows which direction is "uphill"
+        score_sens = 0.01 * fold_enrichment_sens * (1.0 - p_enrichment_sens)
+    if fold_enrichment_res > 1.0:
+        score_res = fold_enrichment_res * (1 - p_enrichment_res)
+    else:
+        score_res = 0.01 * fold_enrichment_res * (1 - p_enrichment_res)
     # Save tracking attributes to trial
     trial.set_user_attr("fold_enrichment_sens", fold_enrichment_sens)
     trial.set_user_attr("p_enrichment_sens", p_enrichment_sens)
     trial.set_user_attr("fold_enrichment_res", fold_enrichment_res)
     trial.set_user_attr("p_enrichment_res", p_enrichment_res)
     # Return combined harmonic mean score
-    if score_sens == 0 or score_res == 0:
-        return 0.0
+    epsilon = 1e-6
+    score_sens = max(score_sens, epsilon)
+    score_res = max(score_res, epsilon)
     return 2 * (score_sens * score_res) / (score_sens + score_res)
 
 # %%
 
-
-drug_id = 1372
+#1 Trametinib = 1372 
+#2 Paclitaxel = 1080
+#3 Vorinostat = 1012
+drug_id = 1012
 tmp_drug_excess_mutation_count_tbl = src.mutation.gene_set_analysis.get_excess_mutation_count_matrix(drug_id,K_matrix,N_vector,dose_data_tbl,all_cells,all_genes)
 
 tmp_drug_data_tbl = dose_data_tbl.query('DRUG_ID == @drug_id')
@@ -299,7 +309,19 @@ study = optuna.create_study(
 )
 
 study.optimize(logit_objective, n_trials=50, timeout=None)  # Adjust trials/timeout as needed
+# %%
 
+
+import optuna.visualization as vis
+
+fig_contour = vis.plot_contour(study, params=["tmp_thresh", "C"])
+fig_contour.show()
+
+fig_history = vis.plot_optimization_history(study)
+fig_history.show()
+
+fig_imp = vis.plot_param_importances(study)
+fig_imp.show()
 # %%
 
 

@@ -452,8 +452,6 @@ def create_interactive_network_explorer(
         lambda row: (
             f"<b>Gene:</b> {row['Gene']}<br>"
             f"<b>Consolidated Intensity:</b> {row['Consolidated_Intensity']:.3f}<br>"
-            f"<b>Consolidated Prevalence:</b> {row['Consolidated_Prevalence']:.3f}<br>"
-            f"<b>Pathways Involved:</b> {len(row['Pathways'])}<br>"
 #            f"<b>Primary Pathways:</b> {', '.join(row['Pathways'][:3])}"
         ), axis=1
     )
@@ -481,7 +479,7 @@ def create_interactive_network_explorer(
         
     # --- Layer 2: Foreground Interactive Gene Nodes ---
     # Size nodes by prevalence, color them by overall mutational intensity
-    node_weights =  nodes_df['Consolidated_Prevalence'].to_numpy()
+    node_weights =  nodes_df['Consolidated_Intensity'].to_numpy()
     marker_sizes = 1 + (node_weights * 25)
     node_names = nodes_df['Gene'].to_list()
     fig.add_trace(

@@ -276,6 +276,13 @@ def predict_proba_by_fold(best_ensemble_obj,X):
     return fold_probs,best_in_data_tbl[0].index
 
 fold_proba_list = predict_proba_by_fold(best_ensemble,best_in_data_tbl)
+
+# %%
+fold_proba_df = []
+for idx in range(fold_proba_list[0].shape[1]):
+    fold_proba_df.append(pd.DataFrame({'sanger_model_id':fold_proba_list[1],'proba':fold_proba_list[0][:,idx]}).assign(fold = idx))
+fold_proba_df = pd.concat(fold_proba_df)
+
 # %%
 from collections import defaultdict
 gene_to_path_dict = defaultdict(list)
@@ -341,13 +348,97 @@ for tmp_gene in unique_pos_genes_elements:
 pd.concat(res_df).groupby(['gene','Features']).agg(tot=('tot','sum')).reset_index().groupby('gene').agg(mtot = ('tot','max')).sort_values('mtot').query('mtot > 0 ')
 
 # %%
-# TODO: filter for cells that with a fold p-sensitivity < 0.5 ~ likely not resistant
-pd.concat(edge_raw_df).rename(columns={'variable':'Features'}).merge(best_ensemble.coef_df).assign(score = lambda df: df.value * df.coef).groupby(['sanger_model_id','Features','gene']).agg(mscore = ('score','sum')).reset_index().groupby(['sanger_model_id','gene']).agg(mscore = ('mscore','max')).reset_index().query('mscore > 0 ')
-
+candidate_cell_gene_combo_df = pd.concat(edge_raw_df).rename(columns={'variable':'Features'}).merge(best_ensemble.coef_df).assign(score = lambda df: df.value * df.coef).merge(fold_proba_df).query('proba > 0.5').groupby(['sanger_model_id','Features','gene']).agg(mscore = ('score','sum')).reset_index().groupby(['sanger_model_id','gene']).agg(mscore = ('mscore','max')).reset_index().query('mscore > 0 ')
 
 # %%
-#    ablated_gene_fold_leading_edge_score_tbl = compute_leading_edge_quantiles_vectorized(ablated_tmp_drug_excess_mutation_count_tbl,best_ensemble.LE_cell[tmp_fold].set_index('Pathway_Name').loc[ablated_tmp_drug_excess_mutation_count_tbl.columns,:].Leading_Edge_Cell_Lines.tolist())
-#    quantile_shift_ablated_gene_fold_leading_edge_score_tbl = fold_leading_edge_score_tbl_list[tmp_fold].loc[:,ablated_gene_fold_leading_edge_score_tbl.columns].sub(ablated_gene_fold_leading_edge_score_tbl).reset_index().merge(tmp_fold_proba_tbl.reset_index(drop=True).rename(columns={'SANGER_MODEL_ID':'sanger_model_id'})).set_index('sanger_model_id')
 
-quantile_shift_ablated_gene_fold_leading_edge_score_tbl.drop('proba',axis=1).mul(quantile_shift_ablated_gene_fold_leading_edge_score_tbl['proba'], axis=0).sum(axis=0).div(quantile_shift_ablated_gene_fold_leading_edge_score_tbl.proba.sum()).reset_index().assign(gene= tmp_gene,fold=tmp_fold).rename(columns={'index':'Features',0:'weighted_QE_score'})
+wide_contrib = candidate_cell_gene_combo_df.pivot(
+        index='sanger_model_id', 
+        columns='gene', 
+        values='mscore'
+    ).fillna(0.0)
+
+binary_positive = (wide_contrib > 0.0).astype(int)
+# %% 
+# 5. Compute shared counts via matrix multiplication: (G_genes x N_cells) @ (N_cells x G_genes)
+matrix_vals = binary_positive.values
+co_occurrence_matrix = np.dot(matrix_vals.T, matrix_vals)
+
+# 6. Format back into a tidy edge list DataFrame
+genes = binary_positive.columns.tolist()
+adj_df = pd.DataFrame(co_occurrence_matrix, index=genes, columns=genes)
+
+edges = (
+    adj_df.stack()
+    .reset_index(name='shared_sensitive_cells')
+    .rename(columns={'level_0': 'gene_A', 'level_1': 'gene_B'})
+).query('shared_sensitive_cells > 1 and gene_A != gene_B')
+
+# %%
+
+tmp_ax = edges.assign(pr = lambda df: df.shared_sensitive_cells.rank(pct=True)).sort_values('shared_sensitive_cells').plot(x='pr',y='shared_sensitive_cells')
+plt.show()
+
+# %%
+
+
+agg_G =  nx.from_pandas_edgelist(
+        edges.loc[:,['gene_A','gene_B','shared_sensitive_cells']].rename(columns={'shared_sensitive_cells':'weight'}), 
+    source='gene_A', 
+    target='gene_B', 
+    edge_attr='weight' 
+)
+
+# %%
+
+agg_node_df = pd.concat(res_df).groupby(['gene','Features']).agg(tot=('tot','sum')).reset_index().groupby(['gene','Features']).agg(mtot = ('tot','sum')).reset_index().groupby('gene').agg(weight = ('mtot','max')).reset_index().rename(columns={'gene':'Gene'}).assign(Consolidated_Intensity = lambda df: df.weight.rank(pct=True))
+# %%
+
+# Build graph just for layout based on pathway affiliation
+shared_pathway_counts = defaultdict(int)
+for pathway in best_ensemble.coef_df.query('coef != 0').Features.to_list():
+    if pathway in gene_set_to_use_dict.keys():
+        # Filter constitutive genes to keep only valid positive contributors
+        genes_in_pathway = [g for g in gene_set_to_use_dict[pathway] if g in agg_G.nodes()]
+        # Generate all unique pairs within this pathway
+        n_genes = len(genes_in_pathway)
+        for i in range(n_genes):
+            for j in range(i + 1, n_genes):
+                # Sort alphabetically to ensure undirected uniqueness (A-B == B-A)
+                pair = tuple(sorted((genes_in_pathway[i], genes_in_pathway[j])))
+                shared_pathway_counts[pair] += 1
+                
+        # Format into a clean edge list DataFrame
+        edge_data = []
+        for (g1, g2), count in shared_pathway_counts.items():
+            if count >= 1:
+                edge_data.append({
+                    'gene_A': g1,
+                    'gene_B': g2,
+                    'shared_pathways': count
+                })
+            
+        pos_edges_df = pd.DataFrame(edge_data)
+        if not pos_edges_df.empty:
+            pos_edges_df = pos_edges_df.sort_values(by='shared_pathways', ascending=False).reset_index(drop=True)
+
+# %%
+pos_G =  nx.from_pandas_edgelist(
+        pos_edges_df.loc[:,['gene_A','gene_B','shared_pathways']].rename(columns={'shared_pathways':'weight'}), 
+    source='gene_A', 
+    target='gene_B', 
+    edge_attr='weight' 
+)
+
+pos = src.integration.leading_edge.spectral_hilbert_layout(pos_G, gap_size=4)
+
+# %%
+# Plotting the result
+
+exi,eyi,ezi = src.integration.leading_edge.generate_edge_contour_matrices(pos,agg_G,pd.DataFrame(pos).iloc[0,:].max(),resolution=500)
+
+# %%
+# interactive form for this visualisation using plotly
+
+src.integration.leading_edge.create_interactive_network_explorer(pos,agg_node_df,exi,eyi,ezi,output_html_path=f'./img/data_leak_proof_{drug_name}_c2_network.html')
 
