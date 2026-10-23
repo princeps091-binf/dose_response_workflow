@@ -382,7 +382,7 @@ def apply_topological_edge_mask(xi, yi, zi, sample_x, sample_y, threshold=0.6, a
     
     # 4. Query the tree: Find the distance to the single NEAREST edge point
     # k=1 tells the tree to only look for the 1 nearest neighbor (no dense matrix allocated!)
-    min_distances, _ = tree.query(grid_points, k=actual_k, workers=5) # workers=-1 uses all CPU cores
+    min_distances, _ = tree.query(grid_points, k=actual_k, workers=1) # workers=-1 uses all CPU cores
     # 5. Take the average distance of those k neighbors for each grid point
     # If k_neighbors was 1, we don't need to average (axis 1 won't exist)
     if actual_k > 1:
@@ -403,7 +403,8 @@ def generate_edge_contour_matrices(pos, G_network, grid_side, resolution=250):
     Transforms raw network edges into dense uniform matrices 
     ready for Matplotlib contourf.
     """
-    # 1. Extract the distance-aware scattered points
+    # SAFETY CAP: Never let resolution accidentally blow past 500x500 unless explicitly intended
+    resolution = min(resolution, 500)    # 1. Extract the distance-aware scattered points
     sample_x, sample_y, sample_z = compute_distance_aware_edge_samples(
         pos, G_network, density_factor=5.0
     )
@@ -429,6 +430,48 @@ def generate_edge_contour_matrices(pos, G_network, grid_side, resolution=250):
     
     return xi, yi, zi
 
+#-----------------
+
+from scipy.ndimage import gaussian_filter
+
+
+def generate_aggregated_edge_surface(
+    pos, G_network, grid_side, resolution=300, sigma=3.0
+):
+  """Generates an aggregate intensity surface of all edge-weights
+
+  over the network layout using weighted 2D binning and Gaussian smoothing.
+  Completely avoids Delaunay triangulation and memory explosions.
+  """
+  # 1. Extract scattered samples along the edges (x, y coords and their weights/intensities z)
+  sample_x, sample_y, sample_z = compute_distance_aware_edge_samples(
+      pos, G_network, density_factor=2.0
+  )
+
+  if len(sample_z) == 0:
+    return None, None, None
+
+  # 2. Accumulate edge weights directly into a 2D grid (Weighted 2D Histogram)
+  # This replaces griddata entirely. O(N) complexity, uses virtually zero RAM.
+  grid_z, xedges, yedges = np.histogram2d(
+      sample_x,
+      sample_y,
+      bins=resolution,
+      range=[[0, grid_side], [0, grid_side]],
+      weights=sample_z,
+  )
+
+  # 3. Smooth the grid to turn discrete pixel bins into a continuous surface (KDE-style)
+  # sigma controls the radius of the edge glow/smoothness
+  smoothed_zi = gaussian_filter(grid_z, sigma=sigma)
+
+  # 4. Build meshgrid coordinates for Matplotlib (contourf / pcolormesh)
+  x_centers = (xedges[:-1] + xedges[1:]) / 2
+  y_centers = (yedges[:-1] + yedges[1:]) / 2
+  xi, yi = np.meshgrid(x_centers, y_centers, indexing="ij")
+
+  # Transpose smoothed_zi to match meshgrid orientation if needed
+  return xi, yi, smoothed_zi
 def create_interactive_network_explorer(
     pos: dict,                  # dict of {gene: (x, y)} from your Hilbert layout
     global_nodes: pd.DataFrame, # Columns: ['Gene', 'Consolidated_Intensity', 'Consolidated_Prevalence', ...]
@@ -567,5 +610,4 @@ def create_interactive_network_explorer(
     # Save to a standalone HTML file containing all necessary JS/CSS
     fig.write_html(output_html_path, auto_open=True)
     print(f"Interactive dashboard successfully generated: {output_html_path}")
-
 

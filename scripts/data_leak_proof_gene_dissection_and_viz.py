@@ -40,7 +40,6 @@ collection_to_use_list = pd.DataFrame.from_dict(list(gene_set_dict.items())).ren
 
 gene_set_to_use_dict = {k: gene_set_dict[k] for k in collection_to_use_list if k in gene_set_dict}
 
-# %%
 dose_coef_tbl = pd.read_csv(dose_fit_file,sep='\t')
 dose_data_tbl = dose_coef_tbl.loc[:,['SANGER_MODEL_ID','CANCER_TYPE', 'DRUG_ID', 'DRUG_NAME','MIN_CONC', 'MAX_CONC','LN_IC50','AUC', 'RMSE']].query('RMSE < 0.2')
 
@@ -199,7 +198,7 @@ def augment_features_for_or_logic(F_df: pd.DataFrame, pathway_rank_df: pd.DataFr
 
 # %%
 
-drug_id = 1372
+drug_id = 1012
 tmp_drug_gene_excess_mutation_count_tbl = src.mutation.gene_set_analysis.get_excess_mutation_count_matrix(drug_id,K_matrix,N_vector,dose_data_tbl,all_cells,all_genes)
 
 tmp_drug_data_tbl = dose_data_tbl.query('DRUG_ID == @drug_id')
@@ -251,8 +250,8 @@ for tmp_fold in range(n_splits):
     fold_drug_excess_mutation_count_tbl = gene_set_collection_excess_count_df.loc[shared_cell_id_list,:]
     fold_leading_edge_score_tbl = compute_leading_edge_quantiles_vectorized(fold_drug_excess_mutation_count_tbl,best_ensemble.LE_cell[tmp_fold].set_index('Pathway_Name').loc[fold_drug_excess_mutation_count_tbl.columns,:].Leading_Edge_Cell_Lines.tolist())
     fold_leading_edge_score_tbl_list.append(fold_leading_edge_score_tbl)
-    best_in_data_tbl.append(augment_features_for_or_logic(fold_leading_edge_score_tbl, best_ensemble.LE_cell[tmp_fold]))
-
+    # best_in_data_tbl.append(augment_features_for_or_logic(fold_leading_edge_score_tbl, best_ensemble.LE_cell[tmp_fold]))
+    best_in_data_tbl.append(fold_leading_edge_score_tbl)
 
 # %%
 new_predictions = best_ensemble.predict_proba(best_in_data_tbl)[:, 1]
@@ -281,6 +280,7 @@ fold_proba_list = predict_proba_by_fold(best_ensemble,best_in_data_tbl)
 fold_proba_df = []
 for idx in range(fold_proba_list[0].shape[1]):
     fold_proba_df.append(pd.DataFrame({'sanger_model_id':fold_proba_list[1],'proba':fold_proba_list[0][:,idx]}).assign(fold = idx))
+
 fold_proba_df = pd.concat(fold_proba_df)
 
 # %%
@@ -358,32 +358,58 @@ wide_contrib = candidate_cell_gene_combo_df.pivot(
         values='mscore'
     ).fillna(0.0)
 
-binary_positive = (wide_contrib > 0.0).astype(int)
 # %% 
 # 5. Compute shared counts via matrix multiplication: (G_genes x N_cells) @ (N_cells x G_genes)
-matrix_vals = binary_positive.values
+matrix_vals = wide_contrib.values
 co_occurrence_matrix = np.dot(matrix_vals.T, matrix_vals)
 
 # 6. Format back into a tidy edge list DataFrame
-genes = binary_positive.columns.tolist()
+genes = wide_contrib.columns.tolist()
 adj_df = pd.DataFrame(co_occurrence_matrix, index=genes, columns=genes)
 
 edges = (
     adj_df.stack()
     .reset_index(name='shared_sensitive_cells')
     .rename(columns={'level_0': 'gene_A', 'level_1': 'gene_B'})
-).query('shared_sensitive_cells > 1 and gene_A != gene_B')
+).query('shared_sensitive_cells > 0 and gene_A != gene_B')
 
 # %%
+filtering_edge_df = edges.sort_values('shared_sensitive_cells',ascending=False).reset_index(drop=True).assign(cum_sum = lambda df: df.shared_sensitive_cells.cumsum())
 
-tmp_ax = edges.assign(pr = lambda df: df.shared_sensitive_cells.rank(pct=True)).sort_values('shared_sensitive_cells').plot(x='pr',y='shared_sensitive_cells')
-plt.show()
-
+total_weight = filtering_edge_df['shared_sensitive_cells'].sum()
+threshold_mass = total_weight * 0.75
+cutoff_idx = filtering_edge_df.cum_sum.gt(threshold_mass).idxmax()
+filtered_edges_df = filtering_edge_df.iloc[:cutoff_idx + 1].copy()
+filtered_edges_df = filtered_edges_df.assign(score_rank = lambda df: df.shared_sensitive_cells.rank(pct=True))
 # %%
-
+#
+# tmp_ax = edges.assign(pr = lambda df: df.shared_sensitive_cells.rank(pct=True)).sort_values('shared_sensitive_cells').plot(x='pr',y='shared_sensitive_cells')
+# plt.show()
+#
+# # %%
+# from kneed import KneeLocator
+# # 1. Sort the edge weights in descending order
+# sorted_weights = np.sort(edges['shared_sensitive_cells'].values)[::-1]
+# x_vals = np.arange(len(sorted_weights))
+# from kneed import KneeLocator
+# kneedle = KneeLocator(
+#     x_vals, 
+#     sorted_weights, 
+#     curve='convex', 
+#     direction='decreasing',
+#     interp_method='polynomial'
+# )
+#
+# # 3. Extract the threshold weight at the knee point
+# threshold_weight = sorted_weights[kneedle.knee]
+#
+# # 4. Subset your original DataFrame to keep only the salient edges
+# df_salient = edges[edges['shared_sensitive_cells'] >= threshold_weight].copy()
+#
+# %%
 
 agg_G =  nx.from_pandas_edgelist(
-        edges.loc[:,['gene_A','gene_B','shared_sensitive_cells']].rename(columns={'shared_sensitive_cells':'weight'}), 
+        filtered_edges_df.loc[:,['gene_A','gene_B','shared_sensitive_cells']].rename(columns={'shared_sensitive_cells':'weight'}), 
     source='gene_A', 
     target='gene_B', 
     edge_attr='weight' 
@@ -407,20 +433,19 @@ for pathway in best_ensemble.coef_df.query('coef != 0').Features.to_list():
                 # Sort alphabetically to ensure undirected uniqueness (A-B == B-A)
                 pair = tuple(sorted((genes_in_pathway[i], genes_in_pathway[j])))
                 shared_pathway_counts[pair] += 1
-                
-        # Format into a clean edge list DataFrame
-        edge_data = []
-        for (g1, g2), count in shared_pathway_counts.items():
-            if count >= 1:
-                edge_data.append({
-                    'gene_A': g1,
-                    'gene_B': g2,
-                    'shared_pathways': count
-                })
-            
-        pos_edges_df = pd.DataFrame(edge_data)
-        if not pos_edges_df.empty:
-            pos_edges_df = pos_edges_df.sort_values(by='shared_pathways', ascending=False).reset_index(drop=True)
+
+edge_data = []
+for (g1, g2), count in shared_pathway_counts.items():
+    if count >= 1:
+        edge_data.append({
+            'gene_A': g1,
+            'gene_B': g2,
+            'shared_pathways': count
+        })
+
+pos_edges_df = pd.DataFrame(edge_data)
+if not pos_edges_df.empty:
+    pos_edges_df = pos_edges_df.sort_values(by='shared_pathways', ascending=False).reset_index(drop=True)
 
 # %%
 pos_G =  nx.from_pandas_edgelist(
@@ -430,12 +455,11 @@ pos_G =  nx.from_pandas_edgelist(
     edge_attr='weight' 
 )
 
-pos = src.integration.leading_edge.spectral_hilbert_layout(pos_G, gap_size=4)
+pos = src.integration.leading_edge.spectral_hilbert_layout(pos_G, gap_size=10)
 
 # %%
-# Plotting the result
 
-exi,eyi,ezi = src.integration.leading_edge.generate_edge_contour_matrices(pos,agg_G,pd.DataFrame(pos).iloc[0,:].max(),resolution=500)
+exi,eyi,ezi = src.integration.leading_edge.generate_edge_contour_matrices(pos,agg_G,pd.DataFrame(pos).iloc[0,:].max(),resolution=100)
 
 # %%
 # interactive form for this visualisation using plotly

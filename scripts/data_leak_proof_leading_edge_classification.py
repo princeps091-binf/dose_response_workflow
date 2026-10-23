@@ -221,7 +221,7 @@ def logit_objective(trial):
         # Check for single-class targets in extreme threshold edge cases
         if y_union.nunique() < 2:
             return 0.0
-        F_augmented_df = augment_features_for_or_logic(fold_leading_edge_score_tbl.loc[y_union.index,out_path], tmp_res)
+        # F_augmented_df = augment_features_for_or_logic(fold_leading_edge_score_tbl.loc[y_union.index,out_path], tmp_res)
         clf = LogisticRegression(
                 l1_ratio=1.0,  # Equal mix of L1 (Lasso) and L2 (Ridge)
                 C=C,         # Inverse regularization strength
@@ -230,10 +230,10 @@ def logit_objective(trial):
                 max_iter=10000,
                 random_state=42 + fold # Vary random state per fold
             )
-        clf.fit(F_augmented_df, y_union)
+        clf.fit(fold_leading_edge_score_tbl.loc[y_union.index,out_path], y_union)
         val_out_path_leading_edge_score_tbl = fold_leading_edge_score_tbl.loc[tmp_drug_excess_mutation_count_tbl.index[val_idx], out_path]
-        val_F_augmented_df = augment_features_for_or_logic(val_out_path_leading_edge_score_tbl, tmp_res)
-        oof_probs[val_idx] = clf.predict_proba(val_F_augmented_df)[:, 1]
+        # val_F_augmented_df = augment_features_for_or_logic(val_out_path_leading_edge_score_tbl, tmp_res)
+        oof_probs[val_idx] = clf.predict_proba(val_out_path_leading_edge_score_tbl)[:, 1]
     # --- OOF EVALUATION METRICS ---
     eval_tbl = (pd.DataFrame({'SANGER_MODEL_ID':tmp_drug_excess_mutation_count_tbl.index,'oof_proba':oof_probs})
                 .merge(tmp_drug_sensitivity_series.reset_index())
@@ -287,7 +287,7 @@ def logit_objective(trial):
 #1 Trametinib = 1372 
 #2 Paclitaxel = 1080
 #3 Vorinostat = 1012
-drug_id = 1012
+drug_id = 1372
 tmp_drug_excess_mutation_count_tbl = src.mutation.gene_set_analysis.get_excess_mutation_count_matrix(drug_id,K_matrix,N_vector,dose_data_tbl,all_cells,all_genes)
 
 tmp_drug_data_tbl = dose_data_tbl.query('DRUG_ID == @drug_id')
@@ -389,10 +389,9 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(tmp_drug_excess_mutation_co
     y_union = pd.Series(cell_ids.isin(LE_cells).astype(int), index=cell_ids)
     best_fold_LE.append(tmp_res.set_index('Pathway_Name').loc[out_path,['Leading_Edge_Cell_Lines','x','y']].reset_index())
     # Check for single-class targets in extreme threshold edge cases
-    F_augmented_df = augment_features_for_or_logic(fold_leading_edge_score_tbl.loc[y_union.index,out_path], tmp_res)
-    best_in_data_tbl.append(augment_features_for_or_logic(fold_leading_edge_score_tbl.loc[:,out_path], tmp_res)
-)
-    best_features.append(F_augmented_df.columns)
+    # F_augmented_df = augment_features_for_or_logic(fold_leading_edge_score_tbl.loc[y_union.index,out_path], tmp_res)
+    best_in_data_tbl.append(fold_leading_edge_score_tbl.loc[:,out_path])
+    best_features.append(best_in_data_tbl)
     clf = LogisticRegression(
             l1_ratio=1.0,  # Equal mix of L1 (Lasso) and L2 (Ridge)
             C=best_C,         # Inverse regularization strength
@@ -401,7 +400,7 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(tmp_drug_excess_mutation_co
             max_iter=10000,
             random_state=42 + fold # Vary random state per fold
         )
-    clf.fit(F_augmented_df, y_union)
+    clf.fit(fold_leading_edge_score_tbl.loc[y_union.index,out_path], y_union)
     best_fold_models.append(clf)
 
 # %%
@@ -429,7 +428,7 @@ pos_features =  (coef_df
 pos_features_gene_content_list = [gene_set_to_use_dict[i] for i in pos_features if i in gene_set_to_use_dict.keys()]
 
 unique_pos_genes_elements = list(set(item for sublist in pos_features_gene_content_list for item in sublist))
-print(unique_pos_genes_elements)
+print(sorted(unique_pos_genes_elements))
 # %%
 
 new_predictions = best_ensemble.predict_proba(best_in_data_tbl)[:, 1]
@@ -439,18 +438,3 @@ new_pred_df = pd.DataFrame({'SANGER_MODEL_ID':best_in_data_tbl[0].index,'proba':
 tmp_drug_sensitivity_series.reset_index().merge(new_pred_df).assign(sensitive = lambda df: df.sensitivity_p.lt(0.5), p_class = lambda df: df.proba.gt(0.5)).groupby('p_class').sensitivity_p.plot.kde(legend=True)
 plt.show()
 
-# %%
-# TODO: run for every gene and compute ablated gene count tables and derive LE quantile for every cell lines for corresponding gene sets, aggregate based on class probability weighted average
-tmp_drug_gene_excess_mutation_count_tbl = src.mutation.gene_set_analysis.get_excess_mutation_count_matrix(drug_id,K_matrix,N_vector,dose_data_tbl,all_cells,all_genes)
-
-# %%
-tmp_fold = 0
-tmp_fold_features = best_ensemble.models[tmp_fold].feature_names_in_
-tmp_fold_gene_set_features_dict = {k: gene_set_to_use_dict[k] for k in tmp_fold_features if k in gene_set_to_use_dict.keys()}
-gene_set_collection_excess_count_df = src.mutation.gene_set_analysis.compute_all_pathway_burdens_vectorized(tmp_drug_gene_excess_mutation_count_tbl.query('gene not in @unique_pos_genes_elements[0]'),all_cells,all_genes,tmp_fold_gene_set_features_dict)
-
-
-
-tmp_drug_excess_mutation_count_tbl = gene_set_collection_excess_count_df.loc[shared_cell_id_list,:]
-
-fold_leading_edge_score_tbl = compute_leading_edge_quantiles_vectorized(tmp_drug_excess_mutation_count_tbl,best_ensemble.LE_cell[tmp_fold].set_index('Pathway_Name').loc[tmp_drug_excess_mutation_count_tbl.columns,:].Leading_Edge_Cell_Lines.tolist())
