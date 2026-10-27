@@ -2,13 +2,13 @@ from scipy.stats import beta, false_discovery_control
 import pandas as pd
 import numpy as np
 
-def get_shrunk_beta_params(df_null):
+def get_shrunk_beta_params(df_null,*,value_col='AUC',id_col='DRUG_ID'):
     # 1. Global Stats
-    global_mean = df_null['AUC'].mean()
-    global_var = df_null['AUC'].var()
+    global_mean = df_null[value_col].mean()
+    global_var = df_null[value_col].var()
     
     # 2. Per-Drug Stats
-    stats = df_null.groupby('DRUG_ID')['AUC'].agg(['mean', 'var', 'count'])
+    stats = df_null.groupby(id_col)[value_col].agg(['mean', 'var', 'count'])
     
     # 3. Calculate Shrinkage Factor (w)
     # Higher count = w closer to 1 (trust the drug data)
@@ -26,6 +26,6 @@ def get_shrunk_beta_params(df_null):
     stats['alpha'] = stats['shrunk_mean'] * phi
     stats['beta'] = (1 - stats['shrunk_mean']) * phi
     
-    return stats.reset_index().loc[:,['DRUG_ID','alpha', 'beta']]
+    return stats.reset_index().loc[:,[id_col,'alpha', 'beta']]
 
 

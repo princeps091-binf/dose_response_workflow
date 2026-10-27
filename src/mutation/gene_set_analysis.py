@@ -183,7 +183,7 @@ def compute_single_pair_worker(task_args):
             
     return best_record
 
-def parallel_mhgt_high_performance(pathway_drug_pairs, dose_data_df, mutation_zscore_df, n_cores=10):
+def parallel_mhgt_high_performance(pathway_drug_pairs, dose_data_df, mutation_zscore_df,*,cell_id = 'SANGER_MODEL_ID', n_cores=10):
     """
     The master pipeline coordinator. Compiles indexes in the parent process 
     and handles dynamic load balancing across workers.
@@ -222,11 +222,14 @@ def parallel_mhgt_high_performance(pathway_drug_pairs, dose_data_df, mutation_zs
 #-------------------------------
 # Excess mutation based enrichment analysis
 
-def get_excess_mutation_count_matrix(drug_id,gene_agg_count_per_cell_matrix,agg_cell_count_matrix,dose_data_tbl,all_cells,all_genes):
+def get_excess_mutation_count_matrix(drug_id,gene_agg_count_per_cell_matrix,agg_cell_count_matrix,dose_data_tbl,all_cells,all_genes,*,group_id = 'DRUG_ID',cell_id='sanger_model_id',gene_name='gene'):
     print("Step 1: Vectorizing the drug-specific resistance masks...")
     # Label cell line resistance per drug via boolean query
-    dose_data_tbl = dose_data_tbl.assign(LN_MAX_CONC = lambda df: np.log(df.MAX_CONC)).assign(is_resistant = lambda df: df.LN_IC50.gt(df.LN_MAX_CONC).astype(int))
-    resistant_cells = set(dose_data_tbl.query('DRUG_ID == @drug_id and is_resistant > 0').SANGER_MODEL_ID.to_list())
+    if 'is_resistant' not in dose_data_tbl.columns:
+        dose_data_tbl = dose_data_tbl.assign(LN_MAX_CONC = lambda df: np.log(df.MAX_CONC)).assign(is_resistant = lambda df: df.LN_IC50.gt(df.LN_MAX_CONC).astype(int))
+        resistant_cells = set(dose_data_tbl.query(f'{group_id} == @drug_id and is_resistant > 0').SANGER_MODEL_ID.to_list())
+    else:
+        resistant_cells = dose_data_tbl.query('is_resistant').loc[:,cell_id].tolist()
     is_in_pool = np.array([1 if cell in resistant_cells else 0 for cell in all_cells]).reshape(-1, 1) # Shape: (n_cells, 1)
     total_resistant_count = np.sum(is_in_pool)
     if total_resistant_count == 0:
@@ -254,21 +257,23 @@ def get_excess_mutation_count_matrix(drug_id,gene_agg_count_per_cell_matrix,agg_
     stacked_series = drug_df.stack()
     stacked_series = stacked_series[stacked_series > 0.0]  # Drop structural zeros to compress memory
     flat_df = stacked_series.reset_index()
-    flat_df.columns = ['sanger_model_id', 'gene', 'excess_mutation_count']
+    flat_df.columns = [cell_id, gene_name, 'excess_mutation_count']
     
     if not stacked_series.empty:
         flat_df = stacked_series.reset_index()
-        flat_df.columns = ['sanger_model_id', 'gene', 'excess_mutation_count']
+        flat_df.columns = [cell_id, gene_name, 'excess_mutation_count']
         return flat_df
     else:
-        return pd.DataFrame(columns=['sanger_model_id', 'gene', 'excess_mutation_count'])
+        return pd.DataFrame(columns=[cell_id, gene_name, 'excess_mutation_count'])
 
 
 def compute_all_pathway_burdens_vectorized(
     single_drug_excess_df: pd.DataFrame,  # Long-form output of your single-drug engine
     all_cells: list,                      # Reference master cell list (base_matrix.index)
     all_genes: list,                      # Reference master gene list (base_matrix.columns)
-    gene_set_collection: dict             # {pathway_name: [list_of_genes]}
+    gene_set_collection: dict,             # {pathway_name: [list_of_genes]}
+    cell_id: str = 'sanger_model_id',
+    gene_name: str = 'gene'
 ) -> pd.DataFrame:
     """
     Computes aggregate excess mutation burdens across an entire collection of gene sets
@@ -290,8 +295,8 @@ def compute_all_pathway_burdens_vectorized(
         gene_to_idx = {gene: i for i, gene in enumerate(all_genes)}
         
         # Extract row/column coordinate maps
-        row_indices = single_drug_excess_df['sanger_model_id'].map(cell_to_idx).values
-        col_indices = single_drug_excess_df['gene'].map(gene_to_idx).values
+        row_indices = single_drug_excess_df[cell_id].map(cell_to_idx).values
+        col_indices = single_drug_excess_df[gene_name].map(gene_to_idx).values
         values = single_drug_excess_df['excess_mutation_count'].values
         
         # Populate the matrix grid using multi-index advanced numpy arrays
@@ -324,7 +329,7 @@ def compute_all_pathway_burdens_vectorized(
         index=all_cells, 
         columns=pathway_names
     )
-    pathway_burden_df.index.name = 'sanger_model_id'
+    pathway_burden_df.index.name = cell_id
     
     print(f"Success. Computed aggregated burdens across {len(pathway_names)} pathways for all cell lines.")
     return pathway_burden_df
